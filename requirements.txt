@@ -21,3 +21,4 @@ torch
 paddleocr
 pytesseract
 fasttext-wheel
+opustools
