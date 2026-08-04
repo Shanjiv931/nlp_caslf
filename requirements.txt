@@ -22,3 +22,4 @@ paddleocr
 pytesseract
 fasttext-wheel
 opustools
+pytest
