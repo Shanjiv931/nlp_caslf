@@ -3,10 +3,12 @@
 Generic seq2seq LoRA fine-tuning script shared by all three ensemble
 engines (IndicTrans2, NLLB-200-distilled-600M, BanglaT5). Designed to run
 on a free Colab/Kaggle T4 GPU (see notebooks/train_colab.ipynb and
-notebooks/train_kaggle.ipynb, which call this script) — this machine has no
-NVIDIA GPU (confirmed via `Get-CimInstance Win32_VideoController`: only an
-integrated AMD iGPU), so this script cannot be run to completion locally;
-it has only been smoke-tested for import/argument correctness here.
+notebooks/train_kaggle.ipynb, which call this script) — the machine this was
+authored on has no NVIDIA GPU (confirmed via `Get-CimInstance
+Win32_VideoController`: only an integrated AMD iGPU), so it was only
+smoke-tested for import/argument correctness there. It has since been run
+for real on Kaggle (T4 x2) and verified working through LoRA setup, dataset
+tokenization, and the start of training.
 
 IndicTrans2 caveat: AI4Bharat's own best-practice preprocessing for
 IndicTrans2 uses their `IndicTransToolkit` (script normalization,
@@ -33,6 +35,14 @@ Checkpointing / resume: saves every `--save_steps` steps to
    though the learned weights carry over. Still far better than discarding
    the weights and starting over, but don't expect bit-identical behavior
    to an uninterrupted run.
+
+   Note this step *attempts* the Hub load and falls back to a fresh LoRA
+   init on any failure, rather than pre-checking whether the repo "exists":
+   Trainer's push_to_hub=True creates the Hub repo the moment Trainer is
+   constructed, well before any real checkpoint is pushed — so a repo can
+   exist yet still have no adapter_config.json in it (e.g. a previous run
+   that crashed before its first --save_steps interval, as happened for
+   real during this project's own Kaggle run on 2026-08-05).
 """
 import argparse
 import glob
@@ -95,6 +105,18 @@ def find_latest_checkpoint(output_dir):
     return max(ckpts, key=lambda p: int(p.rsplit("-", 1)[-1]))
 
 
+def build_lora_config(args):
+    target_modules = (
+        args.lora_target_modules.split(",") if args.lora_target_modules
+        else default_target_modules(args.model_name)
+    )
+    return LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
+        target_modules=target_modules,
+        task_type="SEQ_2_SEQ_LM",
+    )
+
+
 def build_preprocess_fn(tokenizer, direction, max_len, indic_processor):
     src_lang_code = "ben_Beng" if direction == "en2bn" else "eng_Latn"
     tgt_lang_code = "eng_Latn" if direction == "en2bn" else "ben_Beng"
@@ -150,19 +172,8 @@ def main():
         )
 
     resume_path = None  # local checkpoint dir, for exact Trainer-level resume
-    resume_hub_repo = None  # Hub repo fallback, for weights-only resume
     if args.resume:
         resume_path = find_latest_checkpoint(args.output_dir)
-        if not resume_path and args.push_to_hub:
-            from huggingface_hub import repo_exists
-            if repo_exists(args.push_to_hub, repo_type="model"):
-                resume_hub_repo = args.push_to_hub
-                print(f"no local checkpoint in {args.output_dir} — falling back to Hub weights "
-                      f"from {resume_hub_repo} (approximate resume: optimizer/LR-schedule state "
-                      f"restarts, learned weights carry over)")
-            else:
-                print(f"--resume given but neither a local checkpoint nor Hub repo {args.push_to_hub} "
-                      f"exists yet — starting fresh")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
@@ -170,19 +181,29 @@ def main():
     if resume_path:
         print(f"resuming LoRA weights + optimizer/scheduler state from local checkpoint {resume_path}")
         model = PeftModel.from_pretrained(model, resume_path, is_trainable=True)
-    elif resume_hub_repo:
-        model = PeftModel.from_pretrained(model, resume_hub_repo, is_trainable=True)
     else:
-        target_modules = (
-            args.lora_target_modules.split(",") if args.lora_target_modules
-            else default_target_modules(args.model_name)
-        )
-        lora_config = LoraConfig(
-            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
-            target_modules=target_modules,
-            task_type="SEQ_2_SEQ_LM",
-        )
-        model = get_peft_model(model, lora_config)
+        loaded_from_hub = False
+        if args.resume and args.push_to_hub:
+            # Don't just check the Hub repo *exists* — Trainer's push_to_hub=True
+            # creates the repo the moment Trainer is constructed, well before any
+            # real checkpoint is pushed (e.g. a previous run that crashed before
+            # its first --save_steps interval leaves behind an empty repo that
+            # "exists" but has no adapter_config.json). Actually attempt the load
+            # and fall back on failure, instead of guessing in advance.
+            try:
+                model = PeftModel.from_pretrained(model, args.push_to_hub, is_trainable=True)
+                print(f"no local checkpoint in {args.output_dir} — resumed LoRA weights from Hub "
+                      f"repo {args.push_to_hub} instead (approximate resume: optimizer/LR-schedule "
+                      f"state restarts, learned weights carry over)")
+                loaded_from_hub = True
+            except Exception as e:
+                print(f"--resume given, but Hub repo {args.push_to_hub} has no usable adapter "
+                      f"checkpoint yet (commonly because Trainer's push_to_hub=True creates the "
+                      f"repo immediately at startup, before any checkpoint is pushed — e.g. a "
+                      f"previous run that crashed before reaching --save_steps) — starting fresh. "
+                      f"({type(e).__name__}: {e})")
+        if not loaded_from_hub:
+            model = get_peft_model(model, build_lora_config(args))
     model.print_trainable_parameters()
 
     indic_processor = IndicProcessor(inference=False) if (_HAS_INDIC_TOOLKIT and "indictrans2" in args.model_name.lower()) else None

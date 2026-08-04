@@ -175,6 +175,30 @@ around it. Single T4 still has Tensor Cores (unlike P100), so there was no
 reason to recommend switching accelerators — just to stop using the second
 GPU via the broken automatic path.
 
+## Real training run, fourth attempt — root cause found and fixed — 2026-08-05
+Single-GPU fix worked (OOM gone). New failure on this attempt, in the
+resume-fallback code from the "correction" section above:
+`ValueError: Can't find 'adapter_config.json' at 'shanjivkr/catla-nllb-bn2en'`.
+Root cause: `Seq2SeqTrainingArguments(push_to_hub=True, ...)` makes
+`Trainer` **create the Hub repo the moment `Trainer.__init__` runs** — not
+when the first checkpoint is actually pushed. The third attempt's OOM
+happened during the very first backward pass, before `--save_steps 500` was
+ever reached, so `Trainer` had already created `shanjivkr/catla-nllb-bn2en`
+but never pushed any adapter files into it. The resume code's check
+(`repo_exists(args.push_to_hub, repo_type="model")`) is exactly the wrong
+signal here — the repo genuinely "exists," it's just empty.
+
+Real fix (this was a design flaw, not a version/environment quirk like the
+earlier three — worth getting right rather than patching around): removed
+the `repo_exists()` pre-check entirely. `pipeline/train.py` now just
+*attempts* `PeftModel.from_pretrained(model, args.push_to_hub, ...)`
+directly and catches any failure, falling back to a fresh LoRA init
+(factored into a shared `build_lora_config()` helper to avoid duplicating
+that logic across the try/except branches). This is robust to the actual
+failure mode (empty-but-existing repo) and to anything else that could go
+wrong with the Hub load, without needing to enumerate specific error cases
+in advance.
+
 ## Next
 Given training itself is blocked pending the user's action, Phase 7 (the
 quality layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can still
