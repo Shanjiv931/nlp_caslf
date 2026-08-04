@@ -10,6 +10,7 @@ data/processed/*
 !data/processed/.gitkeep
 data/collected_tweets/*
 !data/collected_tweets/.gitkeep
+!data/collected_tweets/test_set.jsonl
 models/*
 !models/.gitkeep
 *.bin
