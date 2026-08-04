@@ -42,3 +42,25 @@ Phase 3 — cleaning, normalization & schema unification: build
 `pipeline/clean.py` to merge Phase 1's `data/raw/` datasets and this proxy
 test set into one unified JSONL schema (bn/en text, hashtags, emojis,
 mentions, code-mix flags, romanization flags) at `data/processed/unified.jsonl`.
+
+## Post-hoc addition — 2026-08-04 (after Phase 6, real live tweets obtained)
+The user separately collected 2,640 real, live tweets (1,348 Bengali, 1,292
+English; 5 topics; deduplicated; no empty rows) via `twitterapi.io`'s
+Advanced Search endpoint — genuine organic Twitter/X data, the thing this
+phase's fallback above couldn't get. However, `twitterapi.io` is a **paid**
+third-party API, conflicting with the PRD's own "$0, no paid APIs"
+constraint. Given that explicitly to the user, their decision: use it for
+**local evaluation only** — never push it to the public HF Hub dataset,
+never use it as training data, never count it toward the "100% free"
+claim.
+
+Implementation: raw files moved to
+`data/raw/twitterapi_io_live_tweets/` (data payloads gitignored; only the
+collection script and a `README_NOT_FREE.md` explaining the constraint are
+committed), normalized via the new `pipeline/process_live_eval_set.py` into
+`data/collected_tweets/live_eval_LOCAL_ONLY.jsonl` (also gitignored,
+2,640 rows, schema-compatible with the rest of the pipeline but tagged
+`is_paid_source: true` / `is_local_eval_only: true`). This file supplements
+(doesn't replace) the free proxy `test_set.jsonl` above, and is earmarked
+for Phase 8 as an additional, genuinely-organic local evaluation set —
+never as training data, never published.

@@ -6,6 +6,10 @@ __pycache__/
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/SOURCES.md
+!data/raw/twitterapi_io_live_tweets/
+data/raw/twitterapi_io_live_tweets/*
+!data/raw/twitterapi_io_live_tweets/scrape_twitter.py
+!data/raw/twitterapi_io_live_tweets/README_NOT_FREE.md
 data/processed/*
 !data/processed/.gitkeep
 data/collected_tweets/*
