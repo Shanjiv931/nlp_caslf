@@ -1,0 +1,28 @@
+# Phase 1 — Dataset Sources
+
+All entries below were verified to exist (via Hugging Face Hub `HfApi` metadata
+lookups or direct repo inspection) before downloading. Nothing here is
+fabricated; anything that could not be verified or downloaded is listed as
+such rather than omitted.
+
+| Name | Local path | Source | License | Rows / pairs | Status |
+|---|---|---|---|---|---|
+| Samanantar (Bengali) | `samanantar_bn/` | [ai4bharat/samanantar](https://huggingface.co/datasets/ai4bharat/samanantar) (HF Hub, `bn` config) | CC-BY-NC-4.0 | 8,604,580 parallel bn-en pairs | downloaded (~1.2GB) |
+| OPUS OpenSubtitles (bn-en) | `opus_opensubtitles_bn_en/` | [OPUS](https://opus.nlpl.eu/OpenSubtitles-v2018.php) via `opustools`, moses format | Per-file redistribution — OPUS states they only host what they believe is freely redistributable; see `LICENSE` file in this folder | 8,931,628 aligned pairs | downloaded (~700MB extracted) |
+| BnSentMix | `bnsentmix/` | [aplycaebous/BnSentMix](https://huggingface.co/datasets/aplycaebous/BnSentMix) (HF Hub) | MIT | 20,050 rows (+ header) | downloaded |
+| SentMix-3L | `sentmix_3l/` | [md-nishat-008/SentMix-3L](https://huggingface.co/datasets/md-nishat-008/SentMix-3L) (HF Hub) | AGPL-3.0 | 1,833 rows (+ header) | downloaded |
+| EmoMix-3L | `emomix_3l/` | [GoswamiDhiman/EmoMix-3L](https://github.com/GoswamiDhiman/EmoMix-3L) (GitHub) | GPL-3.0 | 2,057 rows (+ header) | downloaded |
+| BanglaTLit (+ BanglaTLit-PT) | `banglatlit/` | [aplycaebous/BanglaTLit](https://huggingface.co/datasets/aplycaebous/BanglaTLit) (HF Hub) | MIT | train 245,727 / val 1,500 / test 2,500 + BanglaTLit-PT.txt (245,726 lines) | downloaded |
+| BanTH | `banth/` | [aplycaebous/BanTH](https://huggingface.co/datasets/aplycaebous/BanTH) (HF Hub, mirror of [farhanishmam/BanTH](https://github.com/farhanishmam/BanTH), NAACL'25 Findings) | MIT | full_with_stats 449,265 / train 32,395 / val 4,095 / test 4,060 (YouTube-comment hate-speech labels; **no bn/en parallel columns** — verified directly, contra an earlier unverified claim in this session) | downloaded |
+| HashSet | `hashset/` | [prashantkodali/HashSet](https://github.com/prashantkodali/HashSet) (GitHub, LREC 2022) | see repo (research use) | 1.9k manually annotated + 3.3M loosely-supervised hashtag segmentations | downloaded (~99MB) |
+| En-Bn code-mixed sentiment (2-class) | `en_bn_code_mixed_sentiment/` | [DaliaBarua/En-Bn-Code-Mixed-Two-Class-Sentiment-Dataset](https://huggingface.co/datasets/DaliaBarua/En-Bn-Code-Mixed-Two-Class-Sentiment-Dataset) (HF Hub) | MIT | 100,000 rows (+ header) | downloaded |
+| BE-CM (best-effort match) | `be_cm_ud_bn_en/` | [urmig/UD_bn-en](https://github.com/urmig/UD_bn-en) (GitHub) | MIT | 200 test / 160 tune / 140 train tweet IDs (dependency-parsing annotations; **tweet IDs + annotations only, no raw text** — Twitter ToS-compliant) | downloaded — note: the PRD's literal "BE-CM" name could not be matched to a specific published dataset; this is the closest verified Bengali-English code-mixed Twitter resource found |
+| FLORES-200 (bn-en pair) | — | [facebook/flores](https://huggingface.co/datasets/facebook/flores) (HF Hub) | CC-BY-SA-4.0 (repo access is gated) | — | **not downloaded — gated repo.** Requires an approved Hugging Face account (`huggingface-cli login` + manual access request at the dataset page) before it can be fetched. The official `facebookresearch/flores` GitHub repo was also checked — it only ships tooling/docs, not the actual sentence data (that's distributed via a separate gated Dataverse link). |
+| WAT Indic Multilingual Parallel Corpus (bn-en) | — | http://lotus.kuee.kyoto-u.ac.jp/WAT/indic-multilingual/ | Mixed — an 11M-sentence, 10-language archive aggregating multiple sub-corpora (CVIT-PIB, PMIndia, IITB, etc.); the page explicitly says to "ask the organizers" before using individual source collections | — | **not downloaded** — license terms are a mixed bag across the aggregated sub-corpora and not cleanly Bengali-specific or clearly free of the "ask organizers" caveat; it also substantially overlaps with OPUS-OpenSubtitles and Samanantar, which are already downloaded above with clear licenses |
+| IndicCorp v2 (Bengali), Naamapadam (Bengali) | — | ai4bharat | — | — | **not pursued** — both are monolingual (IndicCorp: raw web text; Naamapadam: NER-tagged text, no released bn-en pairs), so neither adds parallel training data for Phase 6. Skipped as out of scope for the current pipeline design. |
+
+## Notes
+- Total `data/raw/` size: **~2.1GB**.
+- No dataset required paid access; the one gated dataset (FLORES-200) is free but requires a one-time manual HF access request — deferred to the user.
+- `huggingface-cli login` has not been run in this environment. If the user completes it and requests HF access to `facebook/flores`, re-run `python pipeline/download_hf_datasets.py` to pick it up (the script already skips/retries gracefully around individual failures).
+- Download scripts: [`pipeline/download_hf_datasets.py`](../../pipeline/download_hf_datasets.py) (Hugging Face Hub sources) — the OPUS OpenSubtitles and GitHub-clone sources were fetched with one-off commands, documented here rather than as separate scripts since they're single `git clone` / `opustools` invocations.

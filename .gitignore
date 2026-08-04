@@ -5,6 +5,7 @@ __pycache__/
 .env
 data/raw/*
 !data/raw/.gitkeep
+!data/raw/SOURCES.md
 data/processed/*
 !data/processed/.gitkeep
 data/collected_tweets/*
