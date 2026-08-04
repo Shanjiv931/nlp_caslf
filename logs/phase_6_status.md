@@ -72,6 +72,30 @@ achievable here: the training infrastructure itself.
   engine+direction combinations (3 engines x 2 directions) themselves —
   this genuinely cannot be done unattended from this session.
 
+## Correction — 2026-08-05, prompted by the user asking "does resume actually work"
+Good catch: it didn't, for the case that matters most. `find_latest_checkpoint()`
+only ever checked the **local** `--output_dir` for a `checkpoint-N` folder.
+That's fine on Colab if Drive is mounted (persists across disconnects), but
+on **Kaggle, `/kaggle/working/` is wiped between sessions** — so after the
+weekly GPU-quota reset, a fresh Kaggle session would find no local
+checkpoint and silently start LoRA from scratch, discarding everything
+already trained, even though `--push_to_hub` had been pushing checkpoints
+to the Hub the whole time. The Kaggle notebook's own markdown cell already
+*claimed* resume would fall back to the Hub — that claim was aspirational,
+not something the code actually did.
+
+Fixed in `pipeline/train.py`: `--resume` now tries the local checkpoint
+first (exact resume — model + optimizer + LR-schedule state, via Trainer's
+`resume_from_checkpoint`), and if none exists locally but `--push_to_hub`
+points at an existing Hub repo, loads the LoRA adapter weights from there
+instead (`PeftModel.from_pretrained(model, hub_repo, ...)`). Documented
+honestly, in both the script's docstring and the Kaggle notebook's markdown
+cell: the Hub fallback is an **approximate** resume — Trainer's automatic
+Hub push only uploads model/tokenizer files, not optimizer/scheduler state,
+so the LR schedule restarts even though the learned weights carry over.
+Still far better than losing the trained weights outright, which is what
+would have silently happened before this fix.
+
 ## Next
 Given training itself is blocked pending the user's action, Phase 7 (the
 quality layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can still

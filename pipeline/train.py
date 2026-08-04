@@ -16,11 +16,23 @@ it's installed (`pip install IndicTransToolkit`) and falls back to plain
 AutoTokenizer otherwise — the fallback will run and produce a working
 model, but likely at somewhat lower quality than AI4Bharat's own recipe.
 
-Checkpointing: saves every `--save_steps` steps to
-`--output_dir/checkpoint-N` AND (if `--push_to_hub` is given) to the Hub, so
-a Colab/Kaggle session that disconnects can resume via `--resume` — this
-script auto-detects the latest checkpoint in --output_dir if `--resume` is
-passed without a specific path.
+Checkpointing / resume: saves every `--save_steps` steps to
+`--output_dir/checkpoint-N`. `--resume` tries two things in order:
+1. A local `checkpoint-N` folder in `--output_dir` (exact resume — restores
+   model, optimizer, and LR-scheduler state, so training continues as if
+   nothing happened). This is what Colab gets if you mount Google Drive as
+   `--output_dir` (persists across session disconnects).
+2. If no local checkpoint exists AND `--push_to_hub` is set, the LoRA
+   adapter weights are pulled from that Hub repo instead. This is the path
+   Kaggle actually needs: `/kaggle/working/` is wiped between sessions, so
+   after a weekly-quota reset there is no local checkpoint to find, only
+   whatever was last pushed to the Hub. IMPORTANT CAVEAT: this is an
+   approximate resume, not exact — Trainer's automatic hub push only
+   uploads model/tokenizer files, not optimizer/scheduler state, so the
+   learning-rate schedule and optimizer momentum restart from scratch even
+   though the learned weights carry over. Still far better than discarding
+   the weights and starting over, but don't expect bit-identical behavior
+   to an uninterrupted run.
 """
 import argparse
 import glob
@@ -137,16 +149,29 @@ def main():
             load_in_4bit=True, bnb_4bit_compute_dtype="bfloat16", bnb_4bit_quant_type="nf4",
         )
 
-    resume_path = None
+    resume_path = None  # local checkpoint dir, for exact Trainer-level resume
+    resume_hub_repo = None  # Hub repo fallback, for weights-only resume
     if args.resume:
         resume_path = find_latest_checkpoint(args.output_dir)
+        if not resume_path and args.push_to_hub:
+            from huggingface_hub import repo_exists
+            if repo_exists(args.push_to_hub, repo_type="model"):
+                resume_hub_repo = args.push_to_hub
+                print(f"no local checkpoint in {args.output_dir} — falling back to Hub weights "
+                      f"from {resume_hub_repo} (approximate resume: optimizer/LR-schedule state "
+                      f"restarts, learned weights carry over)")
+            else:
+                print(f"--resume given but neither a local checkpoint nor Hub repo {args.push_to_hub} "
+                      f"exists yet — starting fresh")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
 
     if resume_path:
-        print(f"resuming LoRA weights from {resume_path}")
+        print(f"resuming LoRA weights + optimizer/scheduler state from local checkpoint {resume_path}")
         model = PeftModel.from_pretrained(model, resume_path, is_trainable=True)
+    elif resume_hub_repo:
+        model = PeftModel.from_pretrained(model, resume_hub_repo, is_trainable=True)
     else:
         target_modules = (
             args.lora_target_modules.split(",") if args.lora_target_modules
