@@ -219,13 +219,21 @@ def main():
         report_to=[],
     )
 
+    # transformers renamed Trainer's `tokenizer=` kwarg to `processing_class=`
+    # a few releases back and later removed `tokenizer=` outright (hit for
+    # real on Kaggle's pre-installed transformers, 2026-08-05). Inspect the
+    # actual signature rather than hardcoding one name, so this works
+    # whichever version the current environment happens to have.
+    import inspect
+    tok_kwarg = "processing_class" if "processing_class" in inspect.signature(Seq2SeqTrainer.__init__).parameters else "tokenizer"
+
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
-        tokenizer=tokenizer,
+        **{tok_kwarg: tokenizer},
     )
 
     trainer.train(resume_from_checkpoint=resume_path if resume_path else None)

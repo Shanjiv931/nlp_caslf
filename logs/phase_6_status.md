@@ -129,6 +129,27 @@ the "installed but too old" path, which raises — the safer fix since an
 upgrade-version target couldn't be verified against Kaggle's actual
 environment without testing there directly.
 
+## Real training run, second attempt — 2026-08-05
+With the torchao fix in place, got much further: LoRA attached correctly to
+NLLB (`trainable params: 8,650,752 || all params: 1,410,789,376 ||
+trainable%: 0.6132` — confirms `default_target_modules()`'s M2M100-style
+`q_proj`/`k_proj`/`v_proj`/`out_proj`/`fc1`/`fc2` list actually matches
+NLLB's real module names, not just in theory), both train (150,000 rows)
+and val (2,000 rows) datasets tokenized successfully. Then hit:
+`TypeError: Seq2SeqTrainer.__init__() got an unexpected keyword argument
+'tokenizer'` — Kaggle's pre-installed `transformers` has fully removed the
+old `tokenizer=` argument to `Trainer`/`Seq2SeqTrainer` (renamed to
+`processing_class=` a few releases back, then the old name was dropped
+entirely, not just deprecated-with-warning).
+
+Fixed by inspecting `Seq2SeqTrainer.__init__`'s actual signature at runtime
+(`inspect.signature(...).parameters`) rather than hardcoding either kwarg
+name, so `train.py` works whichever `transformers` version an environment
+happens to have — Kaggle's current one, an older pinned one elsewhere, or
+whatever Colab ships. Not yet re-verified end-to-end on Kaggle (the fix is
+committed, but a full training run past this point hasn't been observed
+succeeding yet).
+
 ## Next
 Given training itself is blocked pending the user's action, Phase 7 (the
 quality layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can still
