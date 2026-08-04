@@ -146,9 +146,34 @@ Fixed by inspecting `Seq2SeqTrainer.__init__`'s actual signature at runtime
 (`inspect.signature(...).parameters`) rather than hardcoding either kwarg
 name, so `train.py` works whichever `transformers` version an environment
 happens to have — Kaggle's current one, an older pinned one elsewhere, or
-whatever Colab ships. Not yet re-verified end-to-end on Kaggle (the fix is
-committed, but a full training run past this point hasn't been observed
-succeeding yet).
+whatever Colab ships.
+
+## Real training run, third attempt — 2026-08-05
+Got further still: LoRA setup and dataset tokenization (150,000 train /
+2,000 val rows) both succeeded again, training actually **started**
+(`0%| | 0/2344 [00:00<?, ?it/s]`) and ran a few seconds into the first
+backward pass before failing:
+`torch.OutOfMemoryError: CUDA out of memory... GPU 0 has a total capacity
+of 14.56 GiB of which 6.81 MiB is free`. The stack trace pinpoints the
+cause precisely: it's failing inside `torch/nn/parallel/_functions.py`'s
+`reduce_add_coalesced`/`_flatten_dense_tensors` — `DataParallel`'s
+gradient-gathering mechanism. On a T4 x2 session, `transformers`' `Trainer`
+auto-wraps the model in naive `DataParallel` across both GPUs, but
+`DataParallel` funnels loss computation and gradient-gathering through GPU
+0 specifically, so GPU 0 carries a disproportionate memory load and can OOM
+even though the *combined* memory across both T4s (~29GB) would be plenty.
+
+This corrects earlier advice given to the user (when asked "T4x2 or P100")
+that the second GPU would give a "free" (if imperfect) speedup via
+automatic `DataParallel` — that's true in principle but doesn't hold up
+under this specific OOM failure mode in practice.
+
+Fixed by restricting both notebooks' training cell to a single GPU
+(`CUDA_VISIBLE_DEVICES=0` prefix on the `!python pipeline/train.py` call),
+sidestepping the imbalance entirely rather than trying to tune batch size
+around it. Single T4 still has Tensor Cores (unlike P100), so there was no
+reason to recommend switching accelerators — just to stop using the second
+GPU via the broken automatic path.
 
 ## Next
 Given training itself is blocked pending the user's action, Phase 7 (the
