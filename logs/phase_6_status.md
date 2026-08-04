@@ -96,6 +96,39 @@ so the LR schedule restarts even though the learned weights carry over.
 Still far better than losing the trained weights outright, which is what
 would have silently happened before this fix.
 
+## Reduced scope — 2026-08-05
+User asked for a realistic time estimate. Math with the original defaults
+(`--epochs 3`, full ~572,700 `bn_en_translation` rows in `train.jsonl`,
+`--batch_size 8 --grad_accum 4`): ~215,000 forward/backward passes per
+engine+direction run, roughly 15-40+ hours each depending on model size —
+i.e. potentially **months** across all 6 combinations against a ~30
+GPU-hr/week free quota. Reduced both notebooks' training cell to
+`--epochs 1 --max_train_rows 150000`, cutting this to a rough 2-6 hours per
+combination / ~15-25 hours total — a deliberate quality-for-feasibility
+tradeoff (LoRA's limited capacity means the marginal value of the extra
+data/epochs was shrinking anyway, per the earlier discussion when the user
+asked whether the 300k Samanantar/OPUS caps should be raised).
+
+## Real training run, first attempt — 2026-08-05
+User started the first real training run on Kaggle (`nllb`/`bn2en`,
+T4 x2). Confirmed working: `--resume` correctly detected no local/Hub
+checkpoint yet and started fresh (exactly the fix from above, validated for
+real); model downloaded fine. Then hit an environment issue blocking
+**all** six combinations (happens inside the generic `get_peft_model()`
+call, before any model-specific code runs): Kaggle's base image ships
+`torchao 0.10.0`, but the installed `peft` version's LoRA module dispatcher
+has a version gate that raises `ImportError` for any torchao below 0.16.0,
+instead of gracefully skipping that optional integration — even though
+plain LoRA fine-tuning never uses torchao at all here.
+
+Fixed by adding `!pip uninstall -y torchao -q` to both notebooks'
+install cell, right after `IndicTransToolkit`. Uninstalling entirely
+(rather than trying to pin an upgrade) routes `peft`'s check into its
+normal "not installed" path, which returns `False` cleanly, rather than
+the "installed but too old" path, which raises — the safer fix since an
+upgrade-version target couldn't be verified against Kaggle's actual
+environment without testing there directly.
+
 ## Next
 Given training itself is blocked pending the user's action, Phase 7 (the
 quality layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can still
