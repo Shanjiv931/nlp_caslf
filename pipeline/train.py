@@ -48,6 +48,8 @@ import argparse
 import glob
 import json
 import os
+import sys
+import types
 
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -98,6 +100,42 @@ def default_target_modules(model_name):
     return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
 
 
+def ensure_transformers_onnx_shim():
+    """Newer `transformers` releases removed the `transformers.onnx`
+    submodule (ONNX export moved to the separate `optimum` package), but
+    AI4Bharat's IndicTrans2 custom modeling code — loaded dynamically via
+    `trust_remote_code=True` — still does `from transformers.onnx import
+    OnnxConfig, OnnxSeq2SeqConfigWithPast` at import time, for an optional
+    ONNX-export code path this project never exercises (hit for real on
+    Kaggle's pre-installed transformers, 2026-08-05:
+    `ModuleNotFoundError: No module named 'transformers.onnx'`).
+
+    Downgrading transformers to a version old enough to still have this
+    submodule would risk reopening the torchao/peft version-gate and
+    Seq2SeqTrainer tokenizer/processing_class issues already fixed for the
+    current version, for the sake of an import path we don't use. Instead,
+    inject a minimal placeholder module that satisfies just that import —
+    harmless no-op for every other engine, which never triggers this path.
+    """
+    try:
+        import transformers.onnx  # noqa: F401
+        return  # already importable (older transformers, or already shimmed)
+    except ImportError:
+        pass
+
+    shim = types.ModuleType("transformers.onnx")
+
+    class OnnxConfig:
+        pass
+
+    class OnnxSeq2SeqConfigWithPast(OnnxConfig):
+        pass
+
+    shim.OnnxConfig = OnnxConfig
+    shim.OnnxSeq2SeqConfigWithPast = OnnxSeq2SeqConfigWithPast
+    sys.modules["transformers.onnx"] = shim
+
+
 def find_latest_checkpoint(output_dir):
     ckpts = glob.glob(os.path.join(output_dir, "checkpoint-*"))
     if not ckpts:
@@ -136,6 +174,8 @@ def build_preprocess_fn(tokenizer, direction, max_len, indic_processor):
 
 
 def main():
+    ensure_transformers_onnx_shim()
+
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", required=True, help="e.g. ai4bharat/indictrans2-en-indic-1B, facebook/nllb-200-distilled-600M, csebuetnlp/banglat5")
     p.add_argument("--direction", required=True, choices=["bn2en", "en2bn"])

@@ -242,10 +242,34 @@ two engines), and the training cell resolves `model_name` via
 _engine_entry` so both dict-per-direction and plain-string engines work
 through the same cell unchanged.
 
+## IndicTrans2 attempt, second try — gating resolved, new import error — 2026-08-05
+User requested access to both gated repos; download proceeded fully this
+time (tokenizer + custom `tokenization_indictrans.py`/`configuration_indictrans.py`
+all fetched). New failure loading the model config via `trust_remote_code`:
+`ModuleNotFoundError: No module named 'transformers.onnx'`. Root cause:
+AI4Bharat's custom `configuration_indictrans.py` does `from transformers.onnx
+import OnnxConfig, OnnxSeq2SeqConfigWithPast` at import time, but newer
+`transformers` releases removed that submodule entirely (ONNX export moved
+to the separate `optimum` package). This import is almost certainly only
+needed for an optional ONNX-export code path this project never exercises
+during ordinary `from_pretrained()` + LoRA fine-tuning.
+
+Considered downgrading `transformers` to a version old enough to still have
+`transformers.onnx`, rejected: that risks reopening the torchao/peft
+version-gate issue and the `Seq2SeqTrainer` `tokenizer`/`processing_class`
+rename, both already fixed against the *current* transformers version, for
+the sake of one unused import in someone else's remote code.
+
+Fixed instead with `ensure_transformers_onnx_shim()` in `pipeline/train.py`:
+injects a minimal placeholder `transformers.onnx` module (via
+`sys.modules`) with no-op `OnnxConfig`/`OnnxSeq2SeqConfigWithPast` classes,
+satisfying just the import — called unconditionally at the top of `main()`,
+harmless no-op for the other two engines (which never hit this import path
+in the first place). Not yet re-verified end-to-end on Kaggle.
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
-directions) — user-driven, same process, pending the user requesting
-access to both gated IndicTrans2 repos. In parallel, Phase 7 (the quality
+directions) — user-driven, same process. In parallel, Phase 7 (the quality
 layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
 *code* written and unit-tested against mocked model outputs in this
 session, the same way Phase 6's `train.py` was — a full end-to-end pipeline
