@@ -299,6 +299,46 @@ against the real IndicTrans2 remote code on Kaggle, but this removes the
 need for further single-symbol patching regardless of what else that file
 imports from `transformers.onnx*`.
 
+## IndicTrans2 attempt, fourth try — a third distinct incompatibility, decided to stop chasing them individually — 2026-08-05
+Shim fix worked (config + tokenizer + `modeling_indictrans.py` all
+downloaded, model weights loaded — `model.safetensors: 100%|...| 4.09G`,
+`Loading weights: 100%|...| 763/763`). New, different failure:
+`TypeError: IndicTransForConditionalGeneration.tie_weights() got an
+unexpected keyword argument 'missing_keys'`. Root cause: newer
+`transformers` refactored how `PreTrainedModel._finalize_load_state_dict`
+calls `tie_weights()` (now passes `missing_keys=`/`recompute_mapping=`
+kwargs), but AI4Bharat's custom `IndicTransForConditionalGeneration`
+overrides `tie_weights()` with an older, no-argument signature — Python's
+MRO resolves straight to that override, so there's no way to fix this by
+patching the base `PreTrainedModel` class; the override fully shadows it.
+
+This is the **third** distinct IndicTrans2-remote-code compatibility break
+in a row (ONNX imports x2, now this), each only surfacing after fixing the
+previous one and spending another real Kaggle run to discover it. Checked
+AI4Bharat's own `install.sh`
+(https://github.com/AI4Bharat/IndicTrans2/blob/main/huggingface_interface/install.sh):
+pins `transformers>=4.33.2` — an old, open-ended floor with no upper
+bound. Both breaking changes (ONNX submodule removal, `tie_weights()`
+signature refactor) happened in `transformers` releases well after that,
+which their custom code was never updated to handle. Given the pattern,
+concluded that patching individual internal API mismatches one at a time
+isn't the fix — pinning to the version they actually tested against is.
+
+Fix: both notebooks' training cell now does `!pip install -q
+"transformers==4.33.2"`, conditional on `engine_key == "indictrans2"` only
+— NLLB (already trained, both directions) and BanglaT5 (not yet run) keep
+using whatever transformers Kaggle/Colab ships by default, since neither
+hit any of these three issues. `train.py`'s existing shims/fixes
+(`ensure_transformers_onnx_shim()`, the `inspect.signature`-based
+Trainer-kwarg detection) are left in place, not removed — both already
+no-op cleanly when the underlying compatibility issue isn't present (e.g.
+`ensure_transformers_onnx_shim()`'s `try: import transformers.onnx.utils;
+return` short-circuits immediately if the real submodule already exists at
+4.33.2), so they cost nothing to keep as a safety net. Not yet verified
+end-to-end — this is a notebook-cell-level change, needs a manual edit to
+the user's live notebook or a re-import, not picked up by a plain
+`git clone` re-run.
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
 directions) — user-driven, same process. In parallel, Phase 7 (the quality
