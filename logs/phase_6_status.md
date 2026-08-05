@@ -215,9 +215,37 @@ trainable LoRA params. **2 of 6 engine+direction combinations done.**
 Remaining: `indictrans2` (bn2en, en2bn), `banglat5` (bn2en, en2bn),
 `nllb`'s two are done.
 
+## IndicTrans2 attempt — two real bugs caught before wasting GPU time — 2026-08-05
+1. **Gated repo**: `ai4bharat/indictrans2-en-indic-1B` requires accepting
+   access terms while logged in (same class of gate as FLORES-200 in Phase
+   1, but this one is the "share contact info" self-serve kind — checked
+   the model page directly rather than assuming, confirmed no manual-review
+   language, should be instant). Both IndicTrans2 repos need this:
+   https://huggingface.co/ai4bharat/indictrans2-indic-en-1B and
+   https://huggingface.co/ai4bharat/indictrans2-en-indic-1B.
+2. **Real bug in both notebooks, caught proactively**: `ENGINES["indictrans2"]`
+   only listed `en-indic-1B` (English->Indic), used for *both* directions.
+   Unlike NLLB/BanglaT5 (single bidirectional checkpoints), IndicTrans2
+   ships as two direction-specific models — `indictrans2-indic-en-1B` for
+   bn2en, `indictrans2-en-indic-1B` for en2bn. Using the wrong one as the
+   base for `bn2en` fine-tuning wouldn't have crashed; it would have
+   silently fine-tuned from a base model pretrained for the opposite
+   direction the entire run, likely producing a materially worse result
+   without any error to signal it. This was caught by inspecting the
+   notebooks before the user hit it in practice (the gating error surfaced
+   it), not by running into a failure from it directly.
+
+Fixed: `ENGINES["indictrans2"]` is now `{"bn2en": "...indic-en-1B",
+"en2bn": "...en-indic-1B"}` (a dict, unlike the plain string for the other
+two engines), and the training cell resolves `model_name` via
+`_engine_entry[direction] if isinstance(_engine_entry, dict) else
+_engine_entry` so both dict-per-direction and plain-string engines work
+through the same cell unchanged.
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
-directions) — user-driven, same process. In parallel, Phase 7 (the quality
+directions) — user-driven, same process, pending the user requesting
+access to both gated IndicTrans2 repos. In parallel, Phase 7 (the quality
 layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
 *code* written and unit-tested against mocked model outputs in this
 session, the same way Phase 6's `train.py` was — a full end-to-end pipeline
