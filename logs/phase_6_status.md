@@ -199,11 +199,27 @@ failure mode (empty-but-existing repo) and to anything else that could go
 wrong with the Hub load, without needing to enumerate specific error cases
 in advance.
 
+## First engine complete — 2026-08-05
+**NLLB-200-distilled-600M, both directions, confirmed done.** Verified
+directly against the Hub (`HfApi.model_info(..., files_metadata=True)`),
+not just taking the training run's own claim at face value:
+
+| Repo | adapter_model.safetensors | Last modified |
+|---|---|---|
+| `shanjivkr/catla-nllb-bn2en` | 34.6 MB | 2026-08-04 20:14 |
+| `shanjivkr/catla-nllb-en2bn` | 34.6 MB | 2026-08-05 06:50 |
+
+Both have real `adapter_config.json` + `adapter_model.safetensors` (not the
+empty-repo case fixed earlier), sizes consistent with the reported 8.65M
+trainable LoRA params. **2 of 6 engine+direction combinations done.**
+Remaining: `indictrans2` (bn2en, en2bn), `banglat5` (bn2en, en2bn),
+`nllb`'s two are done.
+
 ## Next
-Given training itself is blocked pending the user's action, Phase 7 (the
-quality layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can still
-have its *code* written and unit-tested against mocked model outputs in this
-session, the same way Phase 6's `train.py` was — the actual end-to-end
-pipeline run (which needs real LoRA-fine-tuned models) will be blocked on
-the same two issues (no working local torch, no trained models yet) until
-the user completes the Colab/Kaggle training and the HF Hub push.
+4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
+directions) — user-driven, same process. In parallel, Phase 7 (the quality
+layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
+*code* written and unit-tested against mocked model outputs in this
+session, the same way Phase 6's `train.py` was — a full end-to-end pipeline
+run needs all 6 adapters plus a working local torch, neither of which
+exist yet, but per-module code + tests don't need to wait for that.
