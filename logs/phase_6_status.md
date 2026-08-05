@@ -267,6 +267,38 @@ satisfying just the import — called unconditionally at the top of `main()`,
 harmless no-op for the other two engines (which never hit this import path
 in the first place). Not yet re-verified end-to-end on Kaggle.
 
+## IndicTrans2 attempt, third try — shim was incomplete, generalized — 2026-08-05
+The first shim fixed the `OnnxConfig`/`OnnxSeq2SeqConfigWithPast` import,
+but `configuration_indictrans.py` needed a *second*, different thing one
+line further down: `from transformers.onnx.utils import
+compute_effective_axis_dimension`, failing with `ModuleNotFoundError: No
+module named 'transformers.onnx.utils'; 'transformers.onnx' is not a
+package` — the original shim was a bare `types.ModuleType` without
+`__path__` set, so Python wouldn't treat it as a package capable of
+resolving submodules at all, regardless of what's inside it.
+
+Rather than keep discovering and patching one missing symbol at a time as
+more of that file's imports surface (each round costs the user a real
+Kaggle run), rewrote `ensure_transformers_onnx_shim()` to be general:
+shims `transformers.onnx` as a proper package (`__path__ = []`) *and*
+`transformers.onnx.utils`, with a `_AutoAttrModule` that synthesizes *any*
+requested attribute via `__getattr__` — a permissive placeholder class
+usable both as a subclassable base (`OnnxConfig`/`OnnxSeq2SeqConfigWithPast`
+are subclassed) and as a plain callable
+(`compute_effective_axis_dimension` is called with numeric args). This
+only needs to survive module-level class definitions/imports, since the
+actual ONNX-export methods are never invoked during ordinary
+`from_pretrained()` + LoRA forward/backward.
+
+Verified the import mechanics standalone before shipping (this machine
+can't run real `transformers`, so tested the exact same shim logic against
+a fake package name instead): `from X.onnx import A, B`,
+`from X.onnx.utils import C`, subclassing `B`, and calling `C(...)` all
+resolved correctly through Python's real import system. Not yet verified
+against the real IndicTrans2 remote code on Kaggle, but this removes the
+need for further single-symbol patching regardless of what else that file
+imports from `transformers.onnx*`.
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
 directions) — user-driven, same process. In parallel, Phase 7 (the quality

@@ -104,36 +104,63 @@ def ensure_transformers_onnx_shim():
     """Newer `transformers` releases removed the `transformers.onnx`
     submodule (ONNX export moved to the separate `optimum` package), but
     AI4Bharat's IndicTrans2 custom modeling code — loaded dynamically via
-    `trust_remote_code=True` — still does `from transformers.onnx import
-    OnnxConfig, OnnxSeq2SeqConfigWithPast` at import time, for an optional
-    ONNX-export code path this project never exercises (hit for real on
-    Kaggle's pre-installed transformers, 2026-08-05:
-    `ModuleNotFoundError: No module named 'transformers.onnx'`).
+    `trust_remote_code=True` — still imports from it at module-load time,
+    for an optional ONNX-export code path this project never exercises.
+    Hit for real on Kaggle's pre-installed transformers, 2026-08-05 — first
+    `ModuleNotFoundError: No module named 'transformers.onnx'` (a plain
+    `from transformers.onnx import OnnxConfig, OnnxSeq2SeqConfigWithPast`),
+    then, after shimming just that, a second, different missing piece one
+    line further down in the same file: `ModuleNotFoundError: No module
+    named 'transformers.onnx.utils'; 'transformers.onnx' is not a package`
+    (`from transformers.onnx.utils import compute_effective_axis_dimension`
+    — the first shim was a bare ModuleType without `__path__`, so Python
+    wouldn't treat it as a package capable of having submodules at all).
 
     Downgrading transformers to a version old enough to still have this
     submodule would risk reopening the torchao/peft version-gate and
     Seq2SeqTrainer tokenizer/processing_class issues already fixed for the
-    current version, for the sake of an import path we don't use. Instead,
-    inject a minimal placeholder module that satisfies just that import —
-    harmless no-op for every other engine, which never triggers this path.
+    current version, for the sake of an import path we don't use. Instead
+    of patching one missing symbol at a time as more surface (as just
+    happened once already), this shims BOTH `transformers.onnx` (as a real
+    package, via `__path__`) and `transformers.onnx.utils`, and — since we
+    can't be sure this is the last symbol that file needs from either —
+    auto-synthesizes *any* attribute requested from them via `__getattr__`,
+    as a permissive placeholder usable both as a subclassable base class
+    (`OnnxConfig`, `OnnxSeq2SeqConfigWithPast` are subclassed) and as a
+    plain callable (`compute_effective_axis_dimension` is called with
+    numeric args). This only needs to survive *module-level* class
+    definitions and imports — the actual ONNX-export methods are never
+    invoked during ordinary `from_pretrained()` + LoRA forward/backward,
+    so the placeholders never need to behave correctly, just exist.
     """
     try:
-        import transformers.onnx  # noqa: F401
+        import transformers.onnx.utils  # noqa: F401
         return  # already importable (older transformers, or already shimmed)
     except ImportError:
         pass
 
-    shim = types.ModuleType("transformers.onnx")
+    class _Permissive:
+        """Accepts any constructor args and does nothing — safe as a base
+        class for subclassing, and safe as the "return value" when called
+        like a function, since nothing in the code paths we actually run
+        inspects what these placeholders produce."""
 
-    class OnnxConfig:
-        pass
+        def __init__(self, *args, **kwargs):
+            pass
 
-    class OnnxSeq2SeqConfigWithPast(OnnxConfig):
-        pass
+    class _AutoAttrModule(types.ModuleType):
+        def __getattr__(self, name):
+            value = type(name, (_Permissive,), {})
+            setattr(self, name, value)
+            return value
 
-    shim.OnnxConfig = OnnxConfig
-    shim.OnnxSeq2SeqConfigWithPast = OnnxSeq2SeqConfigWithPast
-    sys.modules["transformers.onnx"] = shim
+    onnx_shim = _AutoAttrModule("transformers.onnx")
+    onnx_shim.__path__ = []  # mark as a package so `transformers.onnx.utils` resolves
+    utils_shim = _AutoAttrModule("transformers.onnx.utils")
+    onnx_shim.utils = utils_shim
+
+    sys.modules["transformers.onnx"] = onnx_shim
+    sys.modules["transformers.onnx.utils"] = utils_shim
 
 
 def find_latest_checkpoint(output_dir):
