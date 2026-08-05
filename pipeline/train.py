@@ -163,6 +163,84 @@ def ensure_transformers_onnx_shim():
     sys.modules["transformers.onnx.utils"] = utils_shim
 
 
+def ensure_tie_weights_compat():
+    """Newer `transformers` refactored how `PreTrainedModel.
+    _finalize_load_state_dict` calls `tie_weights()` — it now passes
+    `missing_keys=`/`recompute_mapping=` kwargs. AI4Bharat's custom
+    `IndicTransForConditionalGeneration` (loaded via `trust_remote_code`)
+    overrides `tie_weights()` with an older, argument-less signature, so
+    this crashes: `TypeError: IndicTransForConditionalGeneration.
+    tie_weights() got an unexpected keyword argument 'missing_keys'`. Since
+    it's a full override, not an inherited method, patching the *base*
+    PreTrainedModel.tie_weights wouldn't even be consulted — Python's MRO
+    resolves straight to the subclass's version.
+
+    A `transformers==4.33.2` pin (the version AI4Bharat's own install.sh
+    requires) was tried first and abandoned: it transitively needs an old
+    `tokenizers` release with no prebuilt wheel for Python 3.12, and
+    building it from source fails with no Rust toolchain available on
+    Kaggle. So: patch `_finalize_load_state_dict` itself to make whatever
+    model it's finalizing tolerant of an old-style `tie_weights()`, right
+    before calling the real (unmodified) original implementation — this
+    doesn't skip anything the original method does after that call, it
+    just makes the one problematic call succeed. Safe no-op for models
+    whose `tie_weights()` already accepts the new kwargs (NLLB, BanglaT5,
+    or any other model that doesn't override it), since the signature
+    check below only rewraps when the older-style signature is detected.
+    """
+    import inspect as _inspect
+
+    import transformers.modeling_utils as _mu
+
+    if getattr(_mu.PreTrainedModel, "_catla_tie_weights_patched", False):
+        return  # already patched (e.g. a previous call in the same process)
+
+    try:
+        raw = _mu.PreTrainedModel.__dict__["_finalize_load_state_dict"]
+    except KeyError:
+        return  # this transformers version doesn't have this method at all — nothing to patch
+
+    def _make_tie_weights_compatible(model):
+        try:
+            sig = _inspect.signature(model.tie_weights)
+        except (TypeError, ValueError):
+            return
+        has_var_kwargs = any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if has_var_kwargs or "missing_keys" in sig.parameters:
+            return  # already compatible with the new calling convention
+        original_tie_weights = model.tie_weights
+
+        def _compat_tie_weights(*args, **kwargs):
+            return original_tie_weights()
+
+        model.tie_weights = _compat_tie_weights
+
+    if isinstance(raw, classmethod):
+        original_func = raw.__func__
+
+        def wrapper(cls, model, load_config, load_info):
+            _make_tie_weights_compatible(model)
+            return original_func(cls, model, load_config, load_info)
+
+        _mu.PreTrainedModel._finalize_load_state_dict = classmethod(wrapper)
+    elif isinstance(raw, staticmethod):
+        original_func = raw.__func__
+
+        def wrapper(model, load_config, load_info):
+            _make_tie_weights_compatible(model)
+            return original_func(model, load_config, load_info)
+
+        _mu.PreTrainedModel._finalize_load_state_dict = staticmethod(wrapper)
+    else:
+        def wrapper(self, model, load_config, load_info):
+            _make_tie_weights_compatible(model)
+            return raw(self, model, load_config, load_info)
+
+        _mu.PreTrainedModel._finalize_load_state_dict = wrapper
+
+    _mu.PreTrainedModel._catla_tie_weights_patched = True
+
+
 def find_latest_checkpoint(output_dir):
     ckpts = glob.glob(os.path.join(output_dir, "checkpoint-*"))
     if not ckpts:
@@ -202,6 +280,7 @@ def build_preprocess_fn(tokenizer, direction, max_len, indic_processor):
 
 def main():
     ensure_transformers_onnx_shim()
+    ensure_tie_weights_compat()
 
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", required=True, help="e.g. ai4bharat/indictrans2-en-indic-1B, facebook/nllb-200-distilled-600M, csebuetnlp/banglat5")

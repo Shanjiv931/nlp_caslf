@@ -334,10 +334,53 @@ Trainer-kwarg detection) are left in place, not removed — both already
 no-op cleanly when the underlying compatibility issue isn't present (e.g.
 `ensure_transformers_onnx_shim()`'s `try: import transformers.onnx.utils;
 return` short-circuits immediately if the real submodule already exists at
-4.33.2), so they cost nothing to keep as a safety net. Not yet verified
-end-to-end — this is a notebook-cell-level change, needs a manual edit to
-the user's live notebook or a re-import, not picked up by a plain
-`git clone` re-run.
+4.33.2), so they cost nothing to keep as a safety net.
+
+## IndicTrans2 attempt, fifth try — the pin was a dead end, fixed at the code level instead — 2026-08-05
+`!pip install -q "transformers==4.33.2"` failed outright:
+`error: subprocess-exited-with-error` / `Building wheel for tokenizers
+(pyproject.toml) did not run successfully`. Root cause: transformers
+4.33.2 transitively requires an old `tokenizers` release that has no
+prebuilt wheel for Python 3.12 (Kaggle's Python version), so pip falls
+back to building it from source — which needs a Rust toolchain, not
+available in Kaggle's default image. Pip's failed build left the
+originally-installed (newer) transformers untouched, so the script ran
+anyway and hit the *exact same* `tie_weights()` error as before — the pin
+never actually took effect at any point.
+
+Abandoned the version-pin approach entirely (not viable in this
+environment) and fixed it directly at the code level instead:
+`ensure_tie_weights_compat()` in `pipeline/train.py`, called alongside
+`ensure_transformers_onnx_shim()` at the top of `main()`. Monkey-patches
+`transformers.modeling_utils.PreTrainedModel._finalize_load_state_dict`
+(detecting whether the original is a `classmethod`/`staticmethod`/plain
+method and preserving that exact type, since guessing wrong would break
+every model, not just IndicTrans2) to check the *specific model instance's*
+`tie_weights` signature right before calling the real, unmodified original
+implementation — if it doesn't accept `missing_keys`/`**kwargs` (the
+old-style override AI4Bharat's custom class has), the instance's bound
+`tie_weights` is transparently replaced with a wrapper that calls the real
+no-arg version instead. Deliberately does NOT catch-and-skip the exception
+at the call site (an earlier design considered and rejected): that would
+have skipped whatever `_finalize_load_state_dict` does *after* the
+`tie_weights()` call, which could leave the model in a subtly
+under-initialized state without any error to signal it. This approach lets
+the original method run to completion unmodified, just with one internal
+call made compatible.
+
+Verified end-to-end with a standalone mock (real `transformers` doesn't
+run on this machine): reproduced the exact `TypeError` against a fake
+`PreTrainedModel`/subclass pair shaped like the real
+`IndicTransForConditionalGeneration` bug, confirmed the patch fixes it,
+confirmed logic *after* the `tie_weights()` call in the original method
+still executes and its return value is preserved, and confirmed a model
+whose `tie_weights()` already accepts the new kwargs (representative of
+NLLB/BanglaT5) passes its real argument values through completely
+unaffected by the patch. Reverted the dead-end pip-pin notebook cells back
+to the plain training command. Not yet verified against the real
+IndicTrans2 remote code on Kaggle — this fix lives in `pipeline/train.py`,
+so a plain re-run (fresh `git clone`) picks it up automatically, no
+notebook edit needed this time.
 
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
