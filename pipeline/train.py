@@ -260,9 +260,26 @@ def build_lora_config(args):
     )
 
 
-def build_preprocess_fn(tokenizer, direction, max_len, indic_processor):
-    src_lang_code = "ben_Beng" if direction == "en2bn" else "eng_Latn"
-    tgt_lang_code = "eng_Latn" if direction == "en2bn" else "ben_Beng"
+def direction_lang_codes(direction):
+    """Single source of truth for which language is source vs. target.
+    `load_direction_dataset` already puts the correct text in `source`/
+    `target` per direction; this must agree with it exactly, or every
+    language-tagging step downstream (IndicTrans2's required tag prefix,
+    NLLB's tokenizer.src_lang/tgt_lang) silently uses the wrong language --
+    which happened for real: the first version of this function had
+    src_lang_code/tgt_lang_code swapped relative to `direction` (returned
+    "eng_Latn" as the *source* for direction == "bn2en"), caught only when
+    it made IndicTrans2's tokenizer crash outright on 2026-08-05. NLLB has
+    no such crash to catch a similar mistake by -- see the caller in
+    main() for why that direction's already-completed training is at risk.
+    """
+    if direction == "bn2en":
+        return "ben_Beng", "eng_Latn"
+    return "eng_Latn", "ben_Beng"
+
+
+def build_preprocess_fn(tokenizer, direction, max_len, indic_processor, is_indictrans2):
+    src_lang_code, tgt_lang_code = direction_lang_codes(direction)
 
     def preprocess(batch):
         sources = batch["source"]
@@ -270,6 +287,19 @@ def build_preprocess_fn(tokenizer, direction, max_len, indic_processor):
         if indic_processor is not None:
             sources = indic_processor.preprocess_batch(sources, src_lang=src_lang_code, tgt_lang=tgt_lang_code)
             targets = indic_processor.preprocess_batch(targets, src_lang=tgt_lang_code, tgt_lang=src_lang_code)
+        elif is_indictrans2:
+            # IndicTransTokenizer._src_tokenize() requires every input to
+            # already start with "{src_lang} {tgt_lang} " -- normally
+            # IndicProcessor's job, but without it installed the tokenizer
+            # misreads the sentence's own first word as the language tag
+            # and raises (hit for real on 2026-08-05:
+            # `AssertionError: Invalid source language tag: <bengali word>`).
+            # This is the minimum required tagging, not the full
+            # IndicProcessor pipeline (script normalization, sentence
+            # splitting, NER/number masking) -- install IndicTransToolkit
+            # for AI4Bharat's actual recommended preprocessing.
+            sources = [f"{src_lang_code} {tgt_lang_code} {s}" for s in sources]
+            targets = [f"{tgt_lang_code} {src_lang_code} {t}" for t in targets]
         model_inputs = tokenizer(sources, max_length=max_len, truncation=True)
         labels = tokenizer(text_target=targets, max_length=max_len, truncation=True)
         model_inputs["labels"] = labels["input_ids"]
@@ -352,15 +382,33 @@ def main():
             model = get_peft_model(model, build_lora_config(args))
     model.print_trainable_parameters()
 
-    indic_processor = IndicProcessor(inference=False) if (_HAS_INDIC_TOOLKIT and "indictrans2" in args.model_name.lower()) else None
-    if "indictrans2" in args.model_name.lower() and indic_processor is None:
+    is_indictrans2 = "indictrans2" in args.model_name.lower()
+    is_nllb = "nllb" in args.model_name.lower()
+    src_lang_code, tgt_lang_code = direction_lang_codes(args.direction)
+
+    indic_processor = IndicProcessor(inference=False) if (_HAS_INDIC_TOOLKIT and is_indictrans2) else None
+    if is_indictrans2 and indic_processor is None:
         print("WARNING: IndicTransToolkit not installed — falling back to plain tokenization for IndicTrans2. "
               "Install with `pip install IndicTransToolkit` for AI4Bharat's recommended preprocessing.")
+
+    if is_nllb:
+        # NLLB/M2M100-family tokenizers need to be told which language
+        # each example is actually in -- without this they silently use
+        # whatever src_lang the tokenizer defaults to (eng_Latn) for every
+        # example regardless of direction, which affects both the
+        # language-token embedded in the input AND in the labels (so it's
+        # not just an inference-time nicety, it changes what the model is
+        # trained to produce). Previously not set at all anywhere in this
+        # script.
+        if hasattr(tokenizer, "src_lang"):
+            tokenizer.src_lang = src_lang_code
+        if hasattr(tokenizer, "tgt_lang"):
+            tokenizer.tgt_lang = tgt_lang_code
 
     train_ds = load_direction_dataset(args.train_file, args.direction, args.max_train_rows)
     val_ds = load_direction_dataset(args.val_file, args.direction, max_rows=2000)
 
-    preprocess_fn = build_preprocess_fn(tokenizer, args.direction, args.max_len, indic_processor)
+    preprocess_fn = build_preprocess_fn(tokenizer, args.direction, args.max_len, indic_processor, is_indictrans2)
     train_ds = train_ds.map(preprocess_fn, batched=True, remove_columns=["source", "target"])
     val_ds = val_ds.map(preprocess_fn, batched=True, remove_columns=["source", "target"])
 

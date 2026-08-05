@@ -382,11 +382,70 @@ IndicTrans2 remote code on Kaggle — this fix lives in `pipeline/train.py`,
 so a plain re-run (fresh `git clone`) picks it up automatically, no
 notebook edit needed this time.
 
+## IndicTrans2 attempt, sixth try — two language-tagging bugs found, one affects already-completed NLLB training — 2026-08-05
+The `tie_weights` patch worked (model loaded, LoRA applied: `trainable
+params: 17,694,720 || all params: 1,040,701,440`, resume-fallback correctly
+handled an again-empty Hub repo). New failure, this time in tokenization:
+`AssertionError: Invalid source language tag: <bengali word>` inside
+AI4Bharat's custom `tokenization_indictrans.py`. Root cause, two distinct
+bugs found together:
+
+1. **`src_lang_code`/`tgt_lang_code` were swapped relative to `direction`**
+   in `build_preprocess_fn` (`src_lang_code = "ben_Beng" if direction ==
+   "en2bn" else "eng_Latn"` — backwards for both branches). Would have
+   silently fed IndicProcessor the wrong language pair had
+   IndicTransToolkit actually been installed; instead surfaced as a hard
+   crash because of bug 2.
+2. **No fallback tagging when IndicTransToolkit isn't installed.**
+   `IndicTransTokenizer._src_tokenize()` requires every input string to
+   already start with `"{src_lang} {tgt_lang} "` — normally IndicProcessor's
+   job. Without it (confirmed not installed in this Kaggle session — the
+   `WARNING: IndicTransToolkit not installed` line printed right before the
+   crash), the tokenizer tries to parse the sentence's own first word as
+   the language tag and fails.
+
+Fixed both: added `direction_lang_codes()` as the single source of truth
+mapping `direction` -> `(src_lang_code, tgt_lang_code)` (replacing the
+inline swapped logic), and `build_preprocess_fn` now does the minimum
+required manual tag-prefixing (`f"{src} {tgt} {text}"`) when
+`indic_processor` is unavailable, rather than crashing — still recommends
+installing IndicTransToolkit for AI4Bharat's full preprocessing (script
+normalization, sentence splitting, NER/number masking), but no longer hard
+depends on it. Verified the corrected logic standalone (can't run real
+`transformers`/`torch` here): both directions map to the correct language
+pair, and the manual tag-prefix format matches what the tokenizer expects.
+
+**More significant finding, while fixing this: NLLB's tokenizer never had
+`src_lang`/`tgt_lang` set anywhere in the script, for either already-
+completed direction.** NLLB/M2M100-family tokenizers need this set
+explicitly — it affects not just inference-time generation but which
+language token gets embedded in both the *input* and the *label* text
+during training itself. Without it, the tokenizer silently uses whatever
+it defaults to (commonly `eng_Latn`) regardless of the actual example's
+language. Honest assessment of the risk, not overstated in either
+direction: `en2bn`'s *source* text is genuinely English, so that side may
+have coincidentally matched the tokenizer's default — but `tgt_lang` was
+*also* never set, so the *label*-side tagging is uncertain for **both**
+already-completed NLLB directions, not just `bn2en`. Fixed going forward:
+`main()` now sets `tokenizer.src_lang`/`tokenizer.tgt_lang` explicitly from
+`direction_lang_codes()` whenever `is_nllb` is detected, guarded by
+`hasattr()` so it's a no-op for tokenizers without these attributes
+(IndicTrans2's custom tokenizer, BanglaT5's plain T5 tokenizer).
+
+**This is a judgment call for the user, not something to decide
+unilaterally**: whether the two already-completed and Hub-pushed NLLB
+adapters (`shanjivkr/catla-nllb-bn2en`, `shanjivkr/catla-nllb-en2bn`) are
+worth retraining now that this is fixed, given the ~4 hours of GPU time
+that would cost, versus accepting the quality risk and moving on. Flagged
+to the user directly rather than assumed.
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
-directions) — user-driven, same process. In parallel, Phase 7 (the quality
-layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
-*code* written and unit-tested against mocked model outputs in this
-session, the same way Phase 6's `train.py` was — a full end-to-end pipeline
-run needs all 6 adapters plus a working local torch, neither of which
-exist yet, but per-module code + tests don't need to wait for that.
+directions), plus a pending decision on whether to redo the 2 already-
+completed NLLB directions given the language-tagging finding above — all
+user-driven. In parallel, Phase 7 (the quality layer: ensemble/QE-rerank/
+LLM-postedit/round-trip-verify) can have its *code* written and unit-tested
+against mocked model outputs in this session, the same way Phase 6's
+`train.py` was — a full end-to-end pipeline run needs all 6 adapters plus a
+working local torch, neither of which exist yet, but per-module code +
+tests don't need to wait for that.
