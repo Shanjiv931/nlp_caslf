@@ -439,13 +439,25 @@ worth retraining now that this is fixed, given the ~4 hours of GPU time
 that would cost, versus accepting the quality risk and moving on. Flagged
 to the user directly rather than assumed.
 
+## NLLB retrained with the language-tag fix — 2026-08-15
+User opted to retrain both directions rather than accept the risk. Both
+confirmed complete via direct Hub verification (not taken on faith):
+
+| Repo | adapter_model.safetensors | Last modified |
+|---|---|---|
+| `shanjivkr/catla-nllb-bn2en` | 34.6 MB | 2026-08-15 12:40:08 |
+| `shanjivkr/catla-nllb-en2bn` | 34.6 MB | 2026-08-15 14:44:01 |
+
+Both timestamps fresh (well after the original 2026-08-04 runs), sizes
+match the expected adapter size. **NLLB, both directions, done with
+correct `tokenizer.src_lang`/`tokenizer.tgt_lang` handling in place.**
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
-directions), plus a pending decision on whether to redo the 2 already-
-completed NLLB directions given the language-tagging finding above — all
-user-driven. In parallel, Phase 7 (the quality layer: ensemble/QE-rerank/
-LLM-postedit/round-trip-verify) can have its *code* written and unit-tested
-against mocked model outputs in this session, the same way Phase 6's
-`train.py` was — a full end-to-end pipeline run needs all 6 adapters plus a
-working local torch, neither of which exist yet, but per-module code +
+directions) — user-driven. In parallel, Phase 7 (the quality layer:
+ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its *code*
+written and unit-tested against mocked model outputs in this session, the
+same way Phase 6's `train.py` was — a full end-to-end pipeline run needs
+all 6 adapters plus a working local torch, neither of which exist yet, but
+per-module code +
 tests don't need to wait for that.
