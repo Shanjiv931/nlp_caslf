@@ -70,6 +70,34 @@ except ImportError:
     _HAS_INDIC_TOOLKIT = False
 
 
+_SPECIAL_TOKEN_LITERALS = ["<unk>", "<pad>", "<s>", "</s>"]
+
+
+def sanitize_text(text):
+    """Strip literal occurrences of common tokenizer special-token strings
+    from raw text. Some source datasets embed these as data-collection
+    artifacts marking a redacted/unknown word, not meaningful content —
+    confirmed directly during Phase 3 unification, a BanTH row's text
+    contained a literal "<unk>" (e.g. "Notok kom koro priyo <unk>...").
+    Left in place, these coincide with tokenizers' own special-token
+    strings: AI4Bharat's custom IndicTransTokenizer assigns `_src_tokenize`
+    directly as `self._tokenize` (see tokenization_indictrans.py), which
+    the base `PreTrainedTokenizer.tokenize()` calls per-fragment after
+    pre-splitting the input around any literal special-token substring —
+    so a sentence containing "<unk>" gets split at that boundary, and the
+    fragment after it no longer has the "{src_lang} {tgt_lang} " prefix
+    tag_prefixing added to the *start* of the original string. Hit for
+    real on 2026-08-15: `ValueError: not enough values to unpack (expected
+    3, got 1)` inside `_src_tokenize`, 38% through a 150,000-row
+    IndicTrans2 training batch. Applied unconditionally (not just for
+    IndicTrans2) since training any model on literal "<unk>" as if it were
+    meaningful vocabulary is bad signal regardless of tokenizer.
+    """
+    for tok in _SPECIAL_TOKEN_LITERALS:
+        text = text.replace(tok, "")
+    return " ".join(text.split())  # collapse whitespace left behind
+
+
 def load_direction_dataset(path, direction, max_rows=None):
     """direction: 'bn2en' or 'en2bn'. Only bn_en_translation pair_type rows
     are used for MT fine-tuning (transliteration/hashtag/monolingual rows
@@ -86,6 +114,9 @@ def load_direction_dataset(path, direction, max_rows=None):
                 src, tgt = row["text"], row["parallel_text"]  # text is bn, parallel_text is en
             else:
                 src, tgt = row["parallel_text"], row["text"]
+            src, tgt = sanitize_text(src), sanitize_text(tgt)
+            if not src or not tgt:
+                continue  # sanitizing could leave an empty string, e.g. a row that was only "<unk>"
             rows.append({"source": src, "target": tgt})
             if max_rows and len(rows) >= max_rows:
                 break

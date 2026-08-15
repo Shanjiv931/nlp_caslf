@@ -452,6 +452,59 @@ Both timestamps fresh (well after the original 2026-08-04 runs), sizes
 match the expected adapter size. **NLLB, both directions, done with
 correct `tokenizer.src_lang`/`tokenizer.tgt_lang` handling in place.**
 
+## IndicTrans2 attempt, seventh try — root cause finally read from source, not guessed — 2026-08-15
+Furthest yet: model loaded, LoRA applied, `.map()` tokenization ran 38%
+through (57,000/150,000 examples) before: `ValueError: not enough values
+to unpack (expected 3, got 1)` inside `_src_tokenize`
+(`src_lang, tgt_lang, text = text.split(" ", 2)`).
+
+Six previous rounds on this engine were fixed by reasoning from stack
+traces and error messages alone. This one, downloaded and read the actual
+`tokenization_indictrans.py` source directly (via
+`hf_hub_download(repo_id='ai4bharat/indictrans2-indic-en-1B',
+filename='tokenization_indictrans.py')`, since WebFetch can't reach a
+gated repo) rather than guessing further. Root cause, precisely: AI4Bharat's
+`IndicTransTokenizer._switch_to_input_mode()` assigns `self._tokenize =
+self._src_tokenize` directly (line 146) — so whatever `PreTrainedTokenizer
+.tokenize()`'s base implementation passes to `self._tokenize()` per
+fragment, after its own special-token-boundary pre-splitting, `_src_tokenize`
+receives verbatim. Any sentence containing a literal occurrence of one of
+the tokenizer's own special-token strings (`<unk>`, `<pad>`, `<s>`,
+`</s>`) gets split at that boundary before `_src_tokenize` ever sees it —
+and the fragment *after* the boundary no longer has the
+`"{src_lang} {tgt_lang} "` prefix, since that was only ever prepended once
+to the start of the original string.
+
+This ties directly to something already observed firsthand in this
+project: Phase 3's row-inspection of BanTH data showed literal `<unk>` text
+(`"Notok kom koro priyo <unk>👻🥣🤣"`) — a data-collection artifact in
+BanTH marking a redacted/unknown word, not meaningful content. That's
+exactly what's triggering this.
+
+Fixed generally, not just for IndicTrans2: added `sanitize_text()` in
+`pipeline/train.py`, applied to every source/target string in
+`load_direction_dataset()` regardless of engine — strips literal
+`<unk>`/`<pad>`/`<s>`/`</s>` occurrences (collapsing the whitespace left
+behind), and skips any row that sanitizes down to an empty string. Applied
+unconditionally rather than only for IndicTrans2, since training any model
+on a literal "<unk>" as if it were meaningful vocabulary is bad signal
+regardless of tokenizer, not just a crash risk for this one.
+
+**Smaller, separate honesty note**: the already-completed NLLB training
+(both directions, including the just-finished retrain) ran *without* this
+sanitization — it wouldn't have crashed NLLB's tokenizer the way it did
+IndicTrans2's (NLLB doesn't have this custom `_tokenize` reassignment), but
+a handful of examples containing literal `<unk>` as raw text is still a
+minor, diffuse data-quality issue, not a systematic one like the earlier
+language-tag bug. Not recommending another retrain for this alone — noting
+it for completeness, the same way the language-tag issue was surfaced
+rather than silently accepted or silently ignored.
+
+Verified `sanitize_text()` standalone (stripped `<unk>` correctly, and the
+resulting tag-prefixed string now round-trips through `.split(" ", 2)`
+into exactly 3 parts). Not yet verified against the real IndicTrans2 remote
+code on Kaggle — lives in `pipeline/train.py`, picked up by a plain re-run.
+
 ## Next
 4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
 directions) — user-driven. In parallel, Phase 7 (the quality layer:
@@ -459,5 +512,4 @@ ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its *code*
 written and unit-tested against mocked model outputs in this session, the
 same way Phase 6's `train.py` was — a full end-to-end pipeline run needs
 all 6 adapters plus a working local torch, neither of which exist yet, but
-per-module code +
-tests don't need to wait for that.
+per-module code + tests don't need to wait for that.
