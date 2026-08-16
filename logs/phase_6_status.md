@@ -532,13 +532,93 @@ genuinely using the two different IndicTrans2 base models
 reusing one for both. **IndicTrans2 done, both directions. 4 of 6
 engine+direction combinations complete overall** (nllb x2, indictrans2 x2).
 
+## Investigation: why IndicTransToolkit never installed — 2026-08-16
+Both IndicTrans2 directions trained successfully, but without
+`IndicTransToolkit` (AI4Bharat's recommended preprocessing — script
+normalization, sentence splitting, NER/number masking), using this
+project's own minimal tag-prefixing fallback instead. User asked for a
+proper root-cause investigation, explicitly without touching the
+currently-running `banglat5` Kaggle session — done entirely via local
+reproduction and package inspection, nothing run on Kaggle.
+
+**Confirmed, with hard evidence, not guessed:**
+1. `IndicTransToolkit` ships **only as a source distribution** on PyPI
+   (`pip download` resolves to `indictranstoolkit-1.1.1.tar.gz`, no wheel
+   for any platform) — `setup.py` unconditionally Cythonizes and compiles
+   `processor.pyx` into a native extension on every install, on every
+   platform. Reproduced a real build failure locally (`error: Microsoft
+   Visual C++ 14.0 or greater is required`) — but this is Windows-specific
+   (no MSVC on this machine) and doesn't transfer to Kaggle's Linux
+   environment, which normally ships `gcc` and would be expected to
+   compile this fine. Ruled out as *the* Kaggle-side cause, though it
+   confirms the package is inherently fragile to install across platforms.
+2. **The actual likely cause, found by inspecting the dependency graph**:
+   `IndicTransToolkit` depends on `indic-nlp-library-itt` (AI4Bharat's own
+   fork), which installs to the top-level Python package `indicnlp/`.
+   This project's `requirements.txt` *also* already installs a completely
+   different PyPI distribution, plain `indic-nlp-library`, which installs
+   to that exact same `indicnlp/` path. Verified by downloading and
+   unzipping both wheels and diffing their top-level contents — confirmed
+   identical target namespace, different file sets (40KB vs 53KB). pip's
+   conflict detection operates on distribution *names*, not on the actual
+   files/import paths a package writes to — `indic-nlp-library` and
+   `indic-nlp-library-itt` are different names as far as pip is concerned,
+   so pip does not treat this as a conflict and does not warn. Whichever
+   installs second silently overwrites files from whichever installed
+   first inside the shared `indicnlp/` directory, on disk — and since the
+   notebook's install cell runs `pip install -r requirements.txt` (pulls
+   in plain `indic-nlp-library`) *before* `pip install IndicTransToolkit`
+   (pulls in `indic-nlp-library-itt` as a transitive dependency, in a
+   separate pip invocation that doesn't know the first one already claimed
+   that namespace), the result on disk is a `indicnlp/` directory built
+   from an inconsistent mix of both packages' files — a highly plausible
+   cause for `IndicTransToolkit` failing to import or behaving incorrectly
+   at runtime, independent of whether compilation itself succeeded.
+3. Checked whether this project's own code needs plain `indic-nlp-library`
+   at all: `grep -rn "indicnlp" pipeline/` — zero matches. It was added to
+   `requirements.txt` speculatively in Phase 0, straight from the PRD's
+   own suggested package list, and nothing in this codebase ever actually
+   imports it.
+
+**Fixed (both changes are safe — neither touches the running Kaggle
+session, since they only take effect on the *next* fresh `git clone`):**
+- Removed `indic-nlp-library` from `requirements.txt` entirely, so
+  `indic-nlp-library-itt` (pulled in by `IndicTransToolkit` itself) is the
+  only thing that ever claims the `indicnlp/` namespace — the collision
+  can no longer occur, regardless of install order.
+- Separately, and worth keeping regardless of whether the above was the
+  full story: `pipeline/train.py`'s IndicTransToolkit import previously
+  caught only `ImportError` and discarded the actual exception, printing
+  a generic "not installed" message no matter what really happened.
+  Changed to `except Exception` (a compiled-extension failure could
+  surface as an `OSError`/`RuntimeError` just as easily as an
+  `ImportError`) and now captures and prints the real exception
+  type/message in the training log. This is a permanent diagnostics
+  improvement independent of whether the namespace-collision theory turns
+  out to be the complete explanation.
+
+**Honest confidence level**: the namespace collision is well-evidenced
+(confirmed file-level collision, confirmed our own code doesn't need the
+conflicting package, confirmed install-order makes the conflict plausible)
+but not yet *proven* to be the sole or full cause on Kaggle specifically —
+that requires actually seeing the real captured exception from a live run,
+which the diagnostics fix above will surface next time. Both fixes are
+prepared and committed, ready to test once the user chooses to retrain
+IndicTrans2 (both directions would need rerunning to actually benefit from
+AI4Bharat's real preprocessing pipeline) — not done now, and `banglat5`
+was not touched, per explicit instruction.
+
 ## Next
 2 combinations remain (`banglat5` bn2en, `banglat5` en2bn) — user-driven,
 same process (switch `engine_key = "banglat5"`). BanglaT5 hasn't hit any
 engine-specific issues yet since it wasn't touched by any of the
 IndicTrans2-remote-code or NLLB-tokenizer fixes above, but the general
 fixes (torchao/peft, Trainer tokenizer/processing_class,
-`sanitize_text()`) all still apply. In parallel, Phase 7 (the quality
+`sanitize_text()`) all still apply. Once BanglaT5 finishes (all 6
+combinations done), the user can decide whether to retrain IndicTrans2's
+two directions with the namespace-collision fix in place to get AI4Bharat's
+actual recommended preprocessing, informed by what the improved
+diagnostics reveal on that run. In parallel, Phase 7 (the quality
 layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
 *code* written and unit-tested against mocked model outputs in this
 session, the same way Phase 6's `train.py` was — a full end-to-end

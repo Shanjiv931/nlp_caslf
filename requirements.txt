@@ -10,7 +10,6 @@ unbabel-comet
 sentence-transformers
 snscrape
 emoji
-indic-nlp-library
 regex
 tqdm
 huggingface_hub

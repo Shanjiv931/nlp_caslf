@@ -66,8 +66,23 @@ PROCESSED = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 try:
     from IndicTransToolkit.processor import IndicProcessor
     _HAS_INDIC_TOOLKIT = True
-except ImportError:
+    _INDIC_TOOLKIT_IMPORT_ERROR = None
+except Exception as _e:
+    # Deliberately `except Exception`, not just `ImportError`: IndicTransToolkit
+    # ships a compiled Cython extension (processor.pyx -> processor.<so/pyd>),
+    # not a pure-Python module, so a failure here could just as easily be a
+    # runtime loader error (missing shared library, ABI/numpy mismatch) as a
+    # genuine "not installed" ImportError -- those look identical if caught
+    # this narrowly, and the previous version of this except-clause silently
+    # discarded whichever it actually was, printing only a generic "not
+    # installed" message regardless of cause. That made the real Kaggle-side
+    # failure impossible to diagnose from the training log alone (investigated
+    # 2026-08-16: confirmed via local reproduction that IndicTransToolkit is a
+    # source-only PyPI distribution requiring on-the-fly Cython compilation on
+    # every install -- see logs/phase_6_status.md for the full writeup -- but
+    # the *specific* Kaggle-side failure reason was never actually captured).
     _HAS_INDIC_TOOLKIT = False
+    _INDIC_TOOLKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 _SPECIAL_TOKEN_LITERALS = ["<unk>", "<pad>", "<s>", "</s>"]
@@ -419,8 +434,13 @@ def main():
 
     indic_processor = IndicProcessor(inference=False) if (_HAS_INDIC_TOOLKIT and is_indictrans2) else None
     if is_indictrans2 and indic_processor is None:
-        print("WARNING: IndicTransToolkit not installed — falling back to plain tokenization for IndicTrans2. "
-              "Install with `pip install IndicTransToolkit` for AI4Bharat's recommended preprocessing.")
+        reason = _INDIC_TOOLKIT_IMPORT_ERROR or "unknown (import raised no captured exception, unexpected)"
+        print("WARNING: IndicTransToolkit unavailable — falling back to plain tokenization for IndicTrans2. "
+              f"Actual import failure: {reason}. "
+              "Install with `pip install IndicTransToolkit` for AI4Bharat's recommended preprocessing "
+              "(note: this package compiles a Cython extension on install, requiring a working C compiler "
+              "in whatever environment it's installed in — see logs/phase_6_status.md for the full "
+              "investigation of why this can fail).")
 
     if is_nllb:
         # NLLB/M2M100-family tokenizers need to be told which language
