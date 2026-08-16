@@ -521,11 +521,26 @@ consistent with the reported 17.7M trainable params (~2x NLLB's 8.65M) —
 not corrupted, sane. **3 of 6 engine+direction combinations done**
 (nllb x2, indictrans2 bn2en).
 
+## IndicTrans2 en2bn — both IndicTrans2 directions now done — 2026-08-16
+Verified against the Hub: `shanjivkr/catla-indictrans2-en2bn`,
+`adapter_model.safetensors` 70.9MB, last modified 2026-08-16 15:56:24.
+Bonus sanity check: `dict.SRC.json`/`dict.TGT.json` sizes are swapped
+relative to the `bn2en` repo (5.28MB/726KB here vs 726KB/5.28MB there) —
+confirms the direction-specific model-checkpoint fix from earlier is
+genuinely using the two different IndicTrans2 base models
+(`indictrans2-indic-en-1B` vs `indictrans2-en-indic-1B`), not accidentally
+reusing one for both. **IndicTrans2 done, both directions. 4 of 6
+engine+direction combinations complete overall** (nllb x2, indictrans2 x2).
+
 ## Next
-3 combinations remain (`indictrans2` en2bn, `banglat5` x2 directions) —
-user-driven. In parallel, Phase 7 (the quality layer: ensemble/QE-rerank/
-LLM-postedit/round-trip-verify) can have its *code* written and unit-tested
-against mocked model outputs in this session, the same way Phase 6's
-`train.py` was — a full end-to-end pipeline run needs all 6 adapters plus a
-working local torch, neither of which exist yet, but per-module code +
-tests don't need to wait for that.
+2 combinations remain (`banglat5` bn2en, `banglat5` en2bn) — user-driven,
+same process (switch `engine_key = "banglat5"`). BanglaT5 hasn't hit any
+engine-specific issues yet since it wasn't touched by any of the
+IndicTrans2-remote-code or NLLB-tokenizer fixes above, but the general
+fixes (torchao/peft, Trainer tokenizer/processing_class,
+`sanitize_text()`) all still apply. In parallel, Phase 7 (the quality
+layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
+*code* written and unit-tested against mocked model outputs in this
+session, the same way Phase 6's `train.py` was — a full end-to-end
+pipeline run needs all 6 adapters plus a working local torch, neither of
+which exist yet, but per-module code + tests don't need to wait for that.
