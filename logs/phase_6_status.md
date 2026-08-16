@@ -505,11 +505,27 @@ resulting tag-prefixed string now round-trips through `.split(" ", 2)`
 into exactly 3 parts). Not yet verified against the real IndicTrans2 remote
 code on Kaggle — lives in `pipeline/train.py`, picked up by a plain re-run.
 
+## IndicTrans2 bn2en — first successful combination after 7 rounds — 2026-08-15
+Ran clean: `sanitize_text()` fix held (both `Map:` steps hit 100% without
+crashing), training completed all 4,688 steps (~2.5hrs, matching the
+estimate), pushed successfully. Verified directly against the Hub:
+
+| File | Size |
+|---|---|
+| `adapter_config.json` | 1,090 bytes |
+| `adapter_model.safetensors` | 70.9 MB |
+| tokenizer files (dict.SRC/TGT.json, model.SRC/TGT, tokenization_indictrans.py) | all present |
+
+Last modified 2026-08-15 17:42:31. Adapter size (~2x NLLB's 34.6MB) is
+consistent with the reported 17.7M trainable params (~2x NLLB's 8.65M) —
+not corrupted, sane. **3 of 6 engine+direction combinations done**
+(nllb x2, indictrans2 bn2en).
+
 ## Next
-4 combinations remain (`indictrans2` x2 directions, `banglat5` x2
-directions) — user-driven. In parallel, Phase 7 (the quality layer:
-ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its *code*
-written and unit-tested against mocked model outputs in this session, the
-same way Phase 6's `train.py` was — a full end-to-end pipeline run needs
-all 6 adapters plus a working local torch, neither of which exist yet, but
-per-module code + tests don't need to wait for that.
+3 combinations remain (`indictrans2` en2bn, `banglat5` x2 directions) —
+user-driven. In parallel, Phase 7 (the quality layer: ensemble/QE-rerank/
+LLM-postedit/round-trip-verify) can have its *code* written and unit-tested
+against mocked model outputs in this session, the same way Phase 6's
+`train.py` was — a full end-to-end pipeline run needs all 6 adapters plus a
+working local torch, neither of which exist yet, but per-module code +
+tests don't need to wait for that.
