@@ -43,13 +43,16 @@ Checkpointing / resume: saves every `--save_steps` steps to
    exist yet still have no adapter_config.json in it (e.g. a previous run
    that crashed before its first --save_steps interval, as happened for
    real during this project's own Kaggle run on 2026-08-05).
+
+Environment-compatibility shims, language-tagging, and sanitization logic
+were factored out to mt_compat.py on 2026-08-16 so Phase 7's inference code
+(ensemble.py etc.) can reuse the identical preprocessing this script uses
+for training — see mt_compat.py's module docstring.
 """
 import argparse
 import glob
 import json
 import os
-import sys
-import types
 
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -61,56 +64,19 @@ from transformers import (
     Seq2SeqTrainingArguments,
 )
 
+from mt_compat import (
+    HAS_INDIC_TOOLKIT as _HAS_INDIC_TOOLKIT,
+    INDIC_TOOLKIT_IMPORT_ERROR as _INDIC_TOOLKIT_IMPORT_ERROR,
+    default_target_modules,
+    direction_lang_codes,
+    ensure_tie_weights_compat,
+    ensure_transformers_onnx_shim,
+    get_indic_processor,
+    sanitize_text,
+    tag_indictrans2_text,
+)
+
 PROCESSED = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
-
-try:
-    from IndicTransToolkit.processor import IndicProcessor
-    _HAS_INDIC_TOOLKIT = True
-    _INDIC_TOOLKIT_IMPORT_ERROR = None
-except Exception as _e:
-    # Deliberately `except Exception`, not just `ImportError`: IndicTransToolkit
-    # ships a compiled Cython extension (processor.pyx -> processor.<so/pyd>),
-    # not a pure-Python module, so a failure here could just as easily be a
-    # runtime loader error (missing shared library, ABI/numpy mismatch) as a
-    # genuine "not installed" ImportError -- those look identical if caught
-    # this narrowly, and the previous version of this except-clause silently
-    # discarded whichever it actually was, printing only a generic "not
-    # installed" message regardless of cause. That made the real Kaggle-side
-    # failure impossible to diagnose from the training log alone (investigated
-    # 2026-08-16: confirmed via local reproduction that IndicTransToolkit is a
-    # source-only PyPI distribution requiring on-the-fly Cython compilation on
-    # every install -- see logs/phase_6_status.md for the full writeup -- but
-    # the *specific* Kaggle-side failure reason was never actually captured).
-    _HAS_INDIC_TOOLKIT = False
-    _INDIC_TOOLKIT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
-
-
-_SPECIAL_TOKEN_LITERALS = ["<unk>", "<pad>", "<s>", "</s>"]
-
-
-def sanitize_text(text):
-    """Strip literal occurrences of common tokenizer special-token strings
-    from raw text. Some source datasets embed these as data-collection
-    artifacts marking a redacted/unknown word, not meaningful content —
-    confirmed directly during Phase 3 unification, a BanTH row's text
-    contained a literal "<unk>" (e.g. "Notok kom koro priyo <unk>...").
-    Left in place, these coincide with tokenizers' own special-token
-    strings: AI4Bharat's custom IndicTransTokenizer assigns `_src_tokenize`
-    directly as `self._tokenize` (see tokenization_indictrans.py), which
-    the base `PreTrainedTokenizer.tokenize()` calls per-fragment after
-    pre-splitting the input around any literal special-token substring —
-    so a sentence containing "<unk>" gets split at that boundary, and the
-    fragment after it no longer has the "{src_lang} {tgt_lang} " prefix
-    tag_prefixing added to the *start* of the original string. Hit for
-    real on 2026-08-15: `ValueError: not enough values to unpack (expected
-    3, got 1)` inside `_src_tokenize`, 38% through a 150,000-row
-    IndicTrans2 training batch. Applied unconditionally (not just for
-    IndicTrans2) since training any model on literal "<unk>" as if it were
-    meaningful vocabulary is bad signal regardless of tokenizer.
-    """
-    for tok in _SPECIAL_TOKEN_LITERALS:
-        text = text.replace(tok, "")
-    return " ".join(text.split())  # collapse whitespace left behind
 
 
 def load_direction_dataset(path, direction, max_rows=None):
@@ -138,155 +104,6 @@ def load_direction_dataset(path, direction, max_rows=None):
     return Dataset.from_list(rows)
 
 
-def default_target_modules(model_name):
-    name = model_name.lower()
-    if "t5" in name or "banglat5" in name:
-        return ["q", "k", "v", "o"]  # HF T5Attention naming (no "_proj" suffix)
-    # M2M100/NLLB/IndicTrans2-style architectures
-    return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
-
-
-def ensure_transformers_onnx_shim():
-    """Newer `transformers` releases removed the `transformers.onnx`
-    submodule (ONNX export moved to the separate `optimum` package), but
-    AI4Bharat's IndicTrans2 custom modeling code — loaded dynamically via
-    `trust_remote_code=True` — still imports from it at module-load time,
-    for an optional ONNX-export code path this project never exercises.
-    Hit for real on Kaggle's pre-installed transformers, 2026-08-05 — first
-    `ModuleNotFoundError: No module named 'transformers.onnx'` (a plain
-    `from transformers.onnx import OnnxConfig, OnnxSeq2SeqConfigWithPast`),
-    then, after shimming just that, a second, different missing piece one
-    line further down in the same file: `ModuleNotFoundError: No module
-    named 'transformers.onnx.utils'; 'transformers.onnx' is not a package`
-    (`from transformers.onnx.utils import compute_effective_axis_dimension`
-    — the first shim was a bare ModuleType without `__path__`, so Python
-    wouldn't treat it as a package capable of having submodules at all).
-
-    Downgrading transformers to a version old enough to still have this
-    submodule would risk reopening the torchao/peft version-gate and
-    Seq2SeqTrainer tokenizer/processing_class issues already fixed for the
-    current version, for the sake of an import path we don't use. Instead
-    of patching one missing symbol at a time as more surface (as just
-    happened once already), this shims BOTH `transformers.onnx` (as a real
-    package, via `__path__`) and `transformers.onnx.utils`, and — since we
-    can't be sure this is the last symbol that file needs from either —
-    auto-synthesizes *any* attribute requested from them via `__getattr__`,
-    as a permissive placeholder usable both as a subclassable base class
-    (`OnnxConfig`, `OnnxSeq2SeqConfigWithPast` are subclassed) and as a
-    plain callable (`compute_effective_axis_dimension` is called with
-    numeric args). This only needs to survive *module-level* class
-    definitions and imports — the actual ONNX-export methods are never
-    invoked during ordinary `from_pretrained()` + LoRA forward/backward,
-    so the placeholders never need to behave correctly, just exist.
-    """
-    try:
-        import transformers.onnx.utils  # noqa: F401
-        return  # already importable (older transformers, or already shimmed)
-    except ImportError:
-        pass
-
-    class _Permissive:
-        """Accepts any constructor args and does nothing — safe as a base
-        class for subclassing, and safe as the "return value" when called
-        like a function, since nothing in the code paths we actually run
-        inspects what these placeholders produce."""
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-    class _AutoAttrModule(types.ModuleType):
-        def __getattr__(self, name):
-            value = type(name, (_Permissive,), {})
-            setattr(self, name, value)
-            return value
-
-    onnx_shim = _AutoAttrModule("transformers.onnx")
-    onnx_shim.__path__ = []  # mark as a package so `transformers.onnx.utils` resolves
-    utils_shim = _AutoAttrModule("transformers.onnx.utils")
-    onnx_shim.utils = utils_shim
-
-    sys.modules["transformers.onnx"] = onnx_shim
-    sys.modules["transformers.onnx.utils"] = utils_shim
-
-
-def ensure_tie_weights_compat():
-    """Newer `transformers` refactored how `PreTrainedModel.
-    _finalize_load_state_dict` calls `tie_weights()` — it now passes
-    `missing_keys=`/`recompute_mapping=` kwargs. AI4Bharat's custom
-    `IndicTransForConditionalGeneration` (loaded via `trust_remote_code`)
-    overrides `tie_weights()` with an older, argument-less signature, so
-    this crashes: `TypeError: IndicTransForConditionalGeneration.
-    tie_weights() got an unexpected keyword argument 'missing_keys'`. Since
-    it's a full override, not an inherited method, patching the *base*
-    PreTrainedModel.tie_weights wouldn't even be consulted — Python's MRO
-    resolves straight to the subclass's version.
-
-    A `transformers==4.33.2` pin (the version AI4Bharat's own install.sh
-    requires) was tried first and abandoned: it transitively needs an old
-    `tokenizers` release with no prebuilt wheel for Python 3.12, and
-    building it from source fails with no Rust toolchain available on
-    Kaggle. So: patch `_finalize_load_state_dict` itself to make whatever
-    model it's finalizing tolerant of an old-style `tie_weights()`, right
-    before calling the real (unmodified) original implementation — this
-    doesn't skip anything the original method does after that call, it
-    just makes the one problematic call succeed. Safe no-op for models
-    whose `tie_weights()` already accepts the new kwargs (NLLB, BanglaT5,
-    or any other model that doesn't override it), since the signature
-    check below only rewraps when the older-style signature is detected.
-    """
-    import inspect as _inspect
-
-    import transformers.modeling_utils as _mu
-
-    if getattr(_mu.PreTrainedModel, "_catla_tie_weights_patched", False):
-        return  # already patched (e.g. a previous call in the same process)
-
-    try:
-        raw = _mu.PreTrainedModel.__dict__["_finalize_load_state_dict"]
-    except KeyError:
-        return  # this transformers version doesn't have this method at all — nothing to patch
-
-    def _make_tie_weights_compatible(model):
-        try:
-            sig = _inspect.signature(model.tie_weights)
-        except (TypeError, ValueError):
-            return
-        has_var_kwargs = any(p.kind == _inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-        if has_var_kwargs or "missing_keys" in sig.parameters:
-            return  # already compatible with the new calling convention
-        original_tie_weights = model.tie_weights
-
-        def _compat_tie_weights(*args, **kwargs):
-            return original_tie_weights()
-
-        model.tie_weights = _compat_tie_weights
-
-    if isinstance(raw, classmethod):
-        original_func = raw.__func__
-
-        def wrapper(cls, model, load_config, load_info):
-            _make_tie_weights_compatible(model)
-            return original_func(cls, model, load_config, load_info)
-
-        _mu.PreTrainedModel._finalize_load_state_dict = classmethod(wrapper)
-    elif isinstance(raw, staticmethod):
-        original_func = raw.__func__
-
-        def wrapper(model, load_config, load_info):
-            _make_tie_weights_compatible(model)
-            return original_func(model, load_config, load_info)
-
-        _mu.PreTrainedModel._finalize_load_state_dict = staticmethod(wrapper)
-    else:
-        def wrapper(self, model, load_config, load_info):
-            _make_tie_weights_compatible(model)
-            return raw(self, model, load_config, load_info)
-
-        _mu.PreTrainedModel._finalize_load_state_dict = wrapper
-
-    _mu.PreTrainedModel._catla_tie_weights_patched = True
-
-
 def find_latest_checkpoint(output_dir):
     ckpts = glob.glob(os.path.join(output_dir, "checkpoint-*"))
     if not ckpts:
@@ -304,24 +121,6 @@ def build_lora_config(args):
         target_modules=target_modules,
         task_type="SEQ_2_SEQ_LM",
     )
-
-
-def direction_lang_codes(direction):
-    """Single source of truth for which language is source vs. target.
-    `load_direction_dataset` already puts the correct text in `source`/
-    `target` per direction; this must agree with it exactly, or every
-    language-tagging step downstream (IndicTrans2's required tag prefix,
-    NLLB's tokenizer.src_lang/tgt_lang) silently uses the wrong language --
-    which happened for real: the first version of this function had
-    src_lang_code/tgt_lang_code swapped relative to `direction` (returned
-    "eng_Latn" as the *source* for direction == "bn2en"), caught only when
-    it made IndicTrans2's tokenizer crash outright on 2026-08-05. NLLB has
-    no such crash to catch a similar mistake by -- see the caller in
-    main() for why that direction's already-completed training is at risk.
-    """
-    if direction == "bn2en":
-        return "ben_Beng", "eng_Latn"
-    return "eng_Latn", "ben_Beng"
 
 
 def build_preprocess_fn(tokenizer, direction, max_len, indic_processor, is_indictrans2):
@@ -344,8 +143,8 @@ def build_preprocess_fn(tokenizer, direction, max_len, indic_processor, is_indic
             # IndicProcessor pipeline (script normalization, sentence
             # splitting, NER/number masking) -- install IndicTransToolkit
             # for AI4Bharat's actual recommended preprocessing.
-            sources = [f"{src_lang_code} {tgt_lang_code} {s}" for s in sources]
-            targets = [f"{tgt_lang_code} {src_lang_code} {t}" for t in targets]
+            sources = tag_indictrans2_text(sources, src_lang_code, tgt_lang_code)
+            targets = tag_indictrans2_text(targets, tgt_lang_code, src_lang_code)
         model_inputs = tokenizer(sources, max_length=max_len, truncation=True)
         labels = tokenizer(text_target=targets, max_length=max_len, truncation=True)
         model_inputs["labels"] = labels["input_ids"]
@@ -432,7 +231,7 @@ def main():
     is_nllb = "nllb" in args.model_name.lower()
     src_lang_code, tgt_lang_code = direction_lang_codes(args.direction)
 
-    indic_processor = IndicProcessor(inference=False) if (_HAS_INDIC_TOOLKIT and is_indictrans2) else None
+    indic_processor = get_indic_processor(inference=False) if is_indictrans2 else None
     if is_indictrans2 and indic_processor is None:
         reason = _INDIC_TOOLKIT_IMPORT_ERROR or "unknown (import raised no captured exception, unexpected)"
         print("WARNING: IndicTransToolkit unavailable — falling back to plain tokenization for IndicTrans2. "
