@@ -180,19 +180,39 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
                                              source_text=source_text, direction=ctx.direction,
                                              raw_score=score))
 
-        sample_out = ctx.model.generate(
-            **inputs,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.9,
-            num_return_sequences=num_sample_candidates,
-            max_new_tokens=max_new_tokens,
-            **gen_kwargs_common,
-        )
-        for seq in sample_out:
-            text = postprocess_output(ctx, ctx.tokenizer.decode(seq, skip_special_tokens=True))
-            raw_candidates.append(Candidate(text=text, engine=ctx.engine_key, method="sample",
-                                             source_text=source_text, direction=ctx.direction))
+        if num_sample_candidates > 0:
+            # Isolated in its own try/except, deliberately separate from the
+            # beam-search block above: nucleus sampling is strictly a
+            # diversity bonus on top of beam search, not a required source
+            # of candidates, so a sampling-specific failure must never
+            # discard beam candidates already collected. Hit for real on
+            # Kaggle running eval/evaluate.py, 2026-08-17: IndicTrans2
+            # (1B, LoRA-adapted) raised `RuntimeError: probability tensor
+            # contains either inf, nan or element < 0` from `do_sample=True`
+            # generation while beam search on the same input/model had
+            # already succeeded moments earlier in this same function call —
+            # before this fix, that exception propagated out of this
+            # function entirely, and generate_ensemble_candidates' per-engine
+            # try/except then discarded the already-good beam candidates
+            # along with it, silently dropping IndicTrans2 from the ensemble
+            # for that example instead of degrading to beam-only.
+            try:
+                sample_out = ctx.model.generate(
+                    **inputs,
+                    do_sample=True,
+                    top_p=0.9,
+                    temperature=0.9,
+                    num_return_sequences=num_sample_candidates,
+                    max_new_tokens=max_new_tokens,
+                    **gen_kwargs_common,
+                )
+                for seq in sample_out:
+                    text = postprocess_output(ctx, ctx.tokenizer.decode(seq, skip_special_tokens=True))
+                    raw_candidates.append(Candidate(text=text, engine=ctx.engine_key, method="sample",
+                                                     source_text=source_text, direction=ctx.direction))
+            except Exception as e:
+                print(f"WARNING: nucleus sampling failed for engine '{ctx.engine_key}' "
+                      f"({type(e).__name__}: {e}) — continuing with beam-search candidates only")
 
     return dedupe_candidates(raw_candidates)
 
