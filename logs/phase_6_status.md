@@ -608,19 +608,49 @@ IndicTrans2 (both directions would need rerunning to actually benefit from
 AI4Bharat's real preprocessing pipeline) — not done now, and `banglat5`
 was not touched, per explicit instruction.
 
+## BanglaT5 complete — all 6 engine+direction combinations done — 2026-08-16
+Both directions verified against the Hub, no engine-specific issues hit
+(as expected — BanglaT5 was never touched by any of the IndicTrans2-remote-
+code or NLLB-tokenizer fixes, only the general ones: torchao/peft,
+Trainer tokenizer/processing_class, `sanitize_text()`):
+
+| Repo | adapter_model.safetensors | Last modified |
+|---|---|---|
+| `shanjivkr/catla-banglat5-en2bn` | 14.2 MB | 2026-08-16 18:17:06 |
+| `shanjivkr/catla-banglat5-bn2en` | 14.2 MB | 2026-08-16 20:48:40 |
+
+Sizes consistent between directions, smallest of the three engines'
+adapters (matches BanglaT5 being the smallest base model of the three).
+
+## Phase 6 complete: all 6 engine+direction combinations trained and verified
+| Engine | bn2en | en2bn |
+|---|---|---|
+| NLLB-200-distilled-600M | done (retrained once, language-tag fix) | done (retrained once, language-tag fix) |
+| IndicTrans2 | done (7 debugging rounds, see above) | done |
+| BanglaT5 | done | done |
+
+Every adapter verified directly against the HF Hub (`adapter_config.json` +
+`adapter_model.safetensors` present, sane size, fresh timestamp) — never
+taken on a training log's claim alone, given how many times this session
+uncovered `Trainer`'s `push_to_hub=True` creating an empty repo at startup.
+Known, disclosed quality caveats carried forward into Phase 7/8 (not
+re-litigated here, see the "senior ML/NLP engineer" assessment given to
+the user on 2026-08-16): 1 epoch / 150k-row cap per direction, IndicTrans2
+trained without `IndicTransToolkit` (fix prepared, not yet applied/
+retrained — see investigation above), BanglaT5 likely undertrained
+relative to the other two since it had no prior translation pretraining to
+build on, no validation-based checkpoint selection.
+
 ## Next
-2 combinations remain (`banglat5` bn2en, `banglat5` en2bn) — user-driven,
-same process (switch `engine_key = "banglat5"`). BanglaT5 hasn't hit any
-engine-specific issues yet since it wasn't touched by any of the
-IndicTrans2-remote-code or NLLB-tokenizer fixes above, but the general
-fixes (torchao/peft, Trainer tokenizer/processing_class,
-`sanitize_text()`) all still apply. Once BanglaT5 finishes (all 6
-combinations done), the user can decide whether to retrain IndicTrans2's
-two directions with the namespace-collision fix in place to get AI4Bharat's
-actual recommended preprocessing, informed by what the improved
-diagnostics reveal on that run. In parallel, Phase 7 (the quality
-layer: ensemble/QE-rerank/LLM-postedit/round-trip-verify) can have its
-*code* written and unit-tested against mocked model outputs in this
-session, the same way Phase 6's `train.py` was — a full end-to-end
-pipeline run needs all 6 adapters plus a working local torch, neither of
-which exist yet, but per-module code + tests don't need to wait for that.
+Phase 6 is done. Move to Phase 7 (the quality layer: multi-candidate
+ensemble generation across all 3 engines, QE reranking, LLM post-editing,
+round-trip verification) — this is where the PRD's actual accuracy claims
+are supposed to come from, not from any single fine-tuned model's raw
+output. This can be built and unit-tested locally against mocked model
+outputs (same pattern as `train.py`), independent of this machine's
+inability to run real torch/transformers — a full end-to-end run will
+still need Kaggle/Colab or another working-torch environment once the code
+exists. Open question for the user: revisit IndicTrans2 with the
+namespace-collision fix now, or proceed straight to Phase 7 with the
+current 6 adapters and revisit IndicTrans2 later if Phase 8's evaluation
+shows it underperforming.
