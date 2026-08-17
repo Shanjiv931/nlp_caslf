@@ -147,3 +147,27 @@ def test_reassemble_preserves_tokens_already_in_translation():
     mt_output = "hola @user"
     result = reassemble(src, mt_output, target_lang="en")
     assert result.count("@user") == 1
+
+
+def test_reassemble_actually_translates_hashtag_when_verbatim_in_mt_output():
+    # regression test for the 2026-08-16 fix: llm_postedit.py protects
+    # hashtags from editing, which means the source-language hashtag is
+    # now *always* present verbatim in the MT+LLM output by the time this
+    # runs -- the old behavior treated that as "already done" and never
+    # actually translated it. This must not happen: the hashtag has to be
+    # replaced with a real translation, not left as source-language text.
+    src = "eto shundor #ভালোবাসা dekhlam"
+    mt_output = "saw so beautiful #ভালোবাসা"  # hashtag preserved verbatim by the LLM post-editor, as instructed
+    result = reassemble(src, mt_output, target_lang="en", translate_word_fn=lambda w: {"ভালোবাসা": "love"}.get(w, w))
+    assert "#ভালোবাসা" not in result  # old source-language hashtag must not survive untranslated
+    assert "#Love" in result  # rebuilt, translated, CamelCase (target_lang="en")
+    assert result.count("#") == 1  # no duplication of old + new
+
+
+def test_reassemble_no_translate_fn_still_rebuilds_not_just_skips():
+    # even without a translate_word_fn, the old verbatim hashtag should be
+    # removed and rebuilt from its segmented words (not simply left alone)
+    src = "watched #EndGame today"
+    mt_output = "ajke dekhlam #EndGame"
+    result = reassemble(src, mt_output, target_lang="bn")
+    assert result.count("#EndGame") == 1  # rebuilt to the same text here (no translator given), not duplicated

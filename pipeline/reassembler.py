@@ -11,6 +11,22 @@ post-editor prompt enforces (never alter protected tokens). This module's
 job is mainly hashtag reconstruction, plus a defensive pass that re-appends
 any protected token the translation step dropped, so nothing silently
 disappears.
+
+Hashtags are handled differently from the other protected-token types, and
+deliberately so: `llm_postedit.py` puts hashtags in the SAME "must appear
+unchanged" protected-token list as emoji/mentions/URLs — correct, so the
+LLM doesn't mangle them mid-edit — but that means the source-language
+hashtag genuinely does end up sitting verbatim inside the translated
+sentence by the time it reaches this module. An earlier version of this
+function treated that as success ("already preserved, nothing to do"),
+which meant hashtags were NEVER actually segmented/translated/rebuilt in
+the success path — the exact opposite of the PRD's FR8 ("hashtags are
+segmented, translated/transliterated, and rebuilt as valid target-language
+hashtags"), silently leaving a source-language hashtag stuck inside an
+otherwise fully-translated sentence. Fixed 2026-08-16, while building
+Phase 9: hashtags are now always segmented+translated+rebuilt, and if the
+old verbatim source-language hashtag is present in the MT output, it's
+removed (not left duplicated alongside the new one).
 """
 from tokenizer import tokenize
 from hashtag_segmenter import segment_hashtag
@@ -40,14 +56,19 @@ def reassemble(source_text, translated_text, target_lang, translate_word_fn=None
     translate_word_fn: optional callable(word:str) -> str used to translate
     each segmented hashtag word into the target language before rebuilding.
     If omitted, hashtag words are carried over untranslated (segmentation
-    only) — the caller (Phase 9's catla.py) is expected to supply the real
-    translator here once Phase 7 exists.
+    only) — Phase 9's catla.py supplies the real translator.
     """
     result = translated_text
     for token, kind in tokenize(source_text):
         if kind == "hashtag":
+            # Always rebuild in the target language — never treat "the old
+            # source-language hashtag is still sitting in the MT output" as
+            # done, since llm_postedit.py's protected-token contract means
+            # it will be there almost every time. Remove it first so the
+            # rebuilt, translated hashtag doesn't end up duplicated
+            # alongside the untranslated original.
             if token in result:
-                continue  # translation step already preserved it verbatim
+                result = result.replace(token, "").rstrip()
             words = segment_hashtag(token)
             if translate_word_fn:
                 words = [translate_word_fn(w) for w in words]
