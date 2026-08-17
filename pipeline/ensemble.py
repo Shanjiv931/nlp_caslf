@@ -215,6 +215,19 @@ def generate_ensemble_candidates(source_text, direction, engines: Optional[List[
     return all_candidates
 
 
+def translate_single(source_text, direction, engine_key="nllb",
+                      adapter_prefix=mc.DEFAULT_HF_ADAPTER_PREFIX, use_4bit=False) -> str:
+    """Single-engine, beam-search-only translation — no ensemble diversity,
+    no QE reranking, no LLM post-edit, no round-trip verification. Shared
+    by `catla.py`'s "fast mode" (Phase 11's demo toggle) and
+    `eval/evaluate.py`'s single_model_baseline mode, so both use the exact
+    same "what does one fine-tuned engine alone produce" definition rather
+    than two subtly different reimplementations of the same idea."""
+    ctx = load_engine(engine_key, direction, adapter_prefix=adapter_prefix, use_4bit=use_4bit)
+    candidates = generate_candidates_for_engine(ctx, source_text, num_beam_candidates=1, num_sample_candidates=0)
+    return candidates[0].text if candidates else ""
+
+
 if __name__ == "__main__":
     import sys
     text = sys.argv[1] if len(sys.argv) > 1 else "আমি ভালো আছি"

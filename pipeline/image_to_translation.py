@@ -61,7 +61,8 @@ def log_decision(image_path, cleaned_text, gate_result, log_path=LOG_PATH):
     return entry
 
 
-def handle_uploaded_image(image_path, ocr_engine="auto", use_llm_ocr_cleanup=True, log_path=LOG_PATH) -> dict:
+def handle_uploaded_image(image_path, ocr_engine="auto", use_llm_ocr_cleanup=True, log_path=LOG_PATH,
+                           fast_mode=False, roundtrip_engine="nllb") -> dict:
     ocr_result = extract_text(image_path, engine=ocr_engine)
     cleaned = cleanup_ocr_result(ocr_result, use_llm=use_llm_ocr_cleanup)
     cleaned_text = cleaned["text"]
@@ -88,7 +89,8 @@ def handle_uploaded_image(image_path, ocr_engine="auto", use_llm_ocr_cleanup=Tru
         return result
 
     direction = "bn2en" if gate_result["language"] == "bn" else "en2bn"
-    translation_result = catla.translate_tweet(cleaned_text, direction)
+    translation_result = catla.translate_tweet(cleaned_text, direction, roundtrip_engine=roundtrip_engine,
+                                                 fast_mode=fast_mode)
     result["direction"] = direction
     result["translation_result"] = translation_result
     result["translation"] = translation_result.get("translation")

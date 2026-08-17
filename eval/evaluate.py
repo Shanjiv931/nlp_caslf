@@ -72,11 +72,12 @@ def load_test_pairs(path, direction, max_rows=None):
 
 
 def translate_single_model_baseline(source_text, direction, engine_key="nllb"):
-    from ensemble import generate_candidates_for_engine, load_engine
+    # shared with catla.py's "fast mode" (Phase 11's demo toggle) via
+    # ensemble.translate_single(), so both use the exact same "what does
+    # one fine-tuned engine alone produce" definition
+    from ensemble import translate_single
 
-    ctx = load_engine(engine_key, direction)
-    candidates = generate_candidates_for_engine(ctx, source_text, num_beam_candidates=1, num_sample_candidates=0)
-    return candidates[0].text if candidates else ""
+    return translate_single(source_text, direction, engine_key=engine_key)
 
 
 def translate_full_pipeline(source_text, direction):

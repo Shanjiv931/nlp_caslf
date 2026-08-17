@@ -88,7 +88,7 @@ def test_bengali_image_routes_to_bn2en(monkeypatch, tmp_path):
     monkeypatch.setattr(image_to_translation, "extract_text", lambda path, engine="auto": _fake_ocr_result("আমি ভালো আছি"))
     monkeypatch.setattr(image_to_translation, "cleanup_ocr_result", lambda ocr_result, use_llm=True: {**ocr_result})
     monkeypatch.setattr(image_to_translation.catla, "translate_tweet",
-                         lambda text, direction: {"translation": "I am doing well", "direction": direction})
+                         lambda text, direction, **kw: {"translation": "I am doing well", "direction": direction})
 
     result = handle_uploaded_image("fake.png", log_path=str(tmp_path / "log.jsonl"))
     assert result["supported"] is True
@@ -100,17 +100,35 @@ def test_english_image_routes_to_en2bn(monkeypatch, tmp_path):
     monkeypatch.setattr(image_to_translation, "extract_text", lambda path, engine="auto": _fake_ocr_result("I am doing well today"))
     monkeypatch.setattr(image_to_translation, "cleanup_ocr_result", lambda ocr_result, use_llm=True: {**ocr_result})
     monkeypatch.setattr(image_to_translation.catla, "translate_tweet",
-                         lambda text, direction: {"translation": "আমি ভালো আছি", "direction": direction})
+                         lambda text, direction, **kw: {"translation": "আমি ভালো আছি", "direction": direction})
 
     result = handle_uploaded_image("fake.png", log_path=str(tmp_path / "log.jsonl"))
     assert result["supported"] is True
     assert result["direction"] == "en2bn"
 
 
+def test_fast_mode_passed_through_to_translate_tweet(monkeypatch, tmp_path):
+    monkeypatch.setattr(image_to_translation, "extract_text", lambda path, engine="auto": _fake_ocr_result("আমি ভালো আছি"))
+    monkeypatch.setattr(image_to_translation, "cleanup_ocr_result", lambda ocr_result, use_llm=True: {**ocr_result})
+
+    seen_kwargs = {}
+
+    def fake_translate_tweet(text, direction, roundtrip_engine="nllb", fast_mode=False):
+        seen_kwargs["fast_mode"] = fast_mode
+        seen_kwargs["roundtrip_engine"] = roundtrip_engine
+        return {"translation": "I am doing well", "direction": direction}
+
+    monkeypatch.setattr(image_to_translation.catla, "translate_tweet", fake_translate_tweet)
+
+    handle_uploaded_image("fake.png", log_path=str(tmp_path / "log.jsonl"), fast_mode=True, roundtrip_engine="banglat5")
+    assert seen_kwargs["fast_mode"] is True
+    assert seen_kwargs["roundtrip_engine"] == "banglat5"
+
+
 def test_every_call_logs_a_decision(monkeypatch, tmp_path):
     monkeypatch.setattr(image_to_translation, "extract_text", lambda path, engine="auto": _fake_ocr_result("hello there world"))
     monkeypatch.setattr(image_to_translation, "cleanup_ocr_result", lambda ocr_result, use_llm=True: {**ocr_result})
-    monkeypatch.setattr(image_to_translation.catla, "translate_tweet", lambda text, direction: {"translation": "x", "direction": direction})
+    monkeypatch.setattr(image_to_translation.catla, "translate_tweet", lambda text, direction, **kw: {"translation": "x", "direction": direction})
 
     log_path = str(tmp_path / "log.jsonl")
     handle_uploaded_image("fake.png", log_path=log_path)

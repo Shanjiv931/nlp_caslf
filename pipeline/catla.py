@@ -95,9 +95,19 @@ def make_word_translator(direction, engine_key="nllb"):
     return translate_word
 
 
-def translate_tweet(text, direction, engines=None, roundtrip_engine="nllb") -> dict:
+def translate_tweet(text, direction, engines=None, roundtrip_engine="nllb", fast_mode=False) -> dict:
     """The single end-to-end entry point the Gradio demo (Phase 11) and
-    the CLI below both call."""
+    the CLI below both call.
+
+    fast_mode=True skips the ensemble/QE-rerank/LLM-postedit/round-trip-verify
+    quality layer entirely and returns a single beam-search decode from one
+    engine (`roundtrip_engine`, reused as the "which engine" choice rather
+    than adding a fourth parameter) via `ensemble.translate_single()` — the
+    same helper eval/evaluate.py's single_model_baseline mode uses, so "fast
+    mode" and "single-model baseline" stay defined identically. Exists per
+    the PRD's Phase 11 requirement that the demo stay usable on slow free
+    HF Spaces CPU hardware, without forcing every request through 3
+    fine-tuned models + a 7B LLM + a 4th round-trip model."""
     target_lang = "en" if direction == "bn2en" else "bn"
 
     normalized = normalize_slang(text)
@@ -108,9 +118,29 @@ def translate_tweet(text, direction, engines=None, roundtrip_engine="nllb") -> d
         processed = latin_to_bn(normalized)
         transliterated = True
 
-    pipeline_result = quality_pipeline.produce_translation(
-        processed, direction, engines=engines, roundtrip_engine=roundtrip_engine,
-    )
+    if fast_mode:
+        translation_text = ensemble.translate_single(processed, direction, engine_key=roundtrip_engine)
+        pipeline_result = {
+            "translation": translation_text,
+            "winning_engine": roundtrip_engine,
+            "winning_method": "beam_fast_mode",
+            "qe_score": None,
+            "qe_method": "skipped_fast_mode",
+            "roundtrip_similarity": None,
+            "roundtrip_text": None,
+            "low_confidence": False,
+            "verification_note": "fast mode: ensemble/QE/LLM-postedit/round-trip-verify all skipped",
+            "pre_edit_candidate": translation_text,
+            "post_edit_candidate": translation_text,
+            "edit_applied": False,
+            "protected_spans": [],
+            "all_candidates": [(roundtrip_engine, "beam_fast_mode", translation_text)],
+            "error": None,
+        }
+    else:
+        pipeline_result = quality_pipeline.produce_translation(
+            processed, direction, engines=engines, roundtrip_engine=roundtrip_engine,
+        )
 
     translation = pipeline_result.get("translation")
     if translation:
@@ -135,9 +165,16 @@ def main():
     p = argparse.ArgumentParser(description="Translate a Bengali/English tweet with the full CATLA pipeline.")
     p.add_argument("text", help="The tweet text to translate.")
     p.add_argument("--direction", required=True, choices=["bn2en", "en2bn"])
+    p.add_argument("--fast_mode", action="store_true",
+                    help="Skip the ensemble/QE/LLM-postedit/round-trip-verify quality layer; "
+                         "single beam-search decode from one engine only (see --roundtrip_engine).")
+    p.add_argument("--roundtrip_engine", default="nllb", choices=["indictrans2", "nllb", "banglat5"],
+                    help="Engine used for round-trip verification (quality mode) or as the sole "
+                         "engine (fast mode).")
     args = p.parse_args()
 
-    result = translate_tweet(args.text, args.direction)
+    result = translate_tweet(args.text, args.direction, roundtrip_engine=args.roundtrip_engine,
+                              fast_mode=args.fast_mode)
     for k, v in result.items():
         print(f"{k}: {v}")
 

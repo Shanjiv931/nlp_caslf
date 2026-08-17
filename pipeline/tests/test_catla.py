@@ -132,3 +132,60 @@ def test_translate_tweet_word_translator_falls_back_on_failure(monkeypatch):
     result = translate_tweet("dekhlam eta #EndGame", "bn2en")
     assert result["translation"] is not None  # didn't crash
     assert "#EndGame" in result["translation"]  # fell back to the original (untranslated) word
+
+
+# ---- fast_mode ----
+
+def test_fast_mode_calls_translate_single_not_quality_pipeline(monkeypatch):
+    calls = []
+
+    def fake_translate_single(processed, direction, engine_key="nllb"):
+        calls.append((processed, direction, engine_key))
+        return "I am doing well"
+
+    def fail_if_called(*a, **kw):
+        raise AssertionError("quality_pipeline.produce_translation must NOT be called in fast_mode")
+
+    monkeypatch.setattr(catla.ensemble, "translate_single", fake_translate_single)
+    monkeypatch.setattr(catla.quality_pipeline, "produce_translation", fail_if_called)
+    monkeypatch.setattr(catla, "make_word_translator", lambda direction, engine_key="nllb": (lambda w: w))
+
+    result = translate_tweet("আমি ভালো আছি", "bn2en", fast_mode=True)
+    assert result["translation"] == "I am doing well"
+    assert len(calls) == 1
+    assert calls[0][2] == "nllb"  # default roundtrip_engine used as the fast-mode engine
+
+
+def test_fast_mode_respects_custom_engine_choice(monkeypatch):
+    calls = []
+    monkeypatch.setattr(catla.ensemble, "translate_single",
+                         lambda processed, direction, engine_key="nllb": (calls.append(engine_key), "ok")[1])
+    monkeypatch.setattr(catla, "make_word_translator", lambda direction, engine_key="nllb": (lambda w: w))
+
+    translate_tweet("hello", "en2bn", roundtrip_engine="banglat5", fast_mode=True)
+    assert calls == ["banglat5"]
+
+
+def test_fast_mode_skips_qe_and_roundtrip_fields(monkeypatch):
+    monkeypatch.setattr(catla.ensemble, "translate_single", lambda processed, direction, engine_key="nllb": "ok")
+    monkeypatch.setattr(catla, "make_word_translator", lambda direction, engine_key="nllb": (lambda w: w))
+
+    result = translate_tweet("hello", "en2bn", fast_mode=True)
+    assert result["qe_score"] is None
+    assert result["roundtrip_similarity"] is None
+    assert result["low_confidence"] is False
+    assert result["winning_method"] == "beam_fast_mode"
+
+
+def test_quality_mode_is_still_the_default(monkeypatch):
+    # fast_mode defaults to False -- the full quality pipeline must still
+    # run when the caller doesn't opt into fast mode explicitly
+    seen = []
+    _patch_pipeline(monkeypatch, processed_text_seen=seen)
+
+    def fail_if_called(*a, **kw):
+        raise AssertionError("ensemble.translate_single must NOT be called outside fast_mode")
+
+    monkeypatch.setattr(catla.ensemble, "translate_single", fail_if_called)
+    result = translate_tweet("আমি ভালো আছি", "bn2en")
+    assert len(seen) == 1  # quality_pipeline.produce_translation was called
