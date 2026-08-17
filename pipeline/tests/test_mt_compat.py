@@ -87,3 +87,78 @@ def test_tag_prefix_survives_sanitization_pipeline():
     clean = sanitize_text(raw)
     tagged = tag_indictrans2_text(clean, "ben_Beng", "eng_Latn")
     assert len(tagged.split(" ", 2)) == 3
+
+
+# ---- ensure_transformers_onnx_shim() ----
+# Unlike ensure_tie_weights_compat() (needs transformers.modeling_utils,
+# which imports torch -- unavailable on this machine), this shim is pure
+# module-registration logic with no torch dependency at all, and
+# `transformers` itself (without torch) genuinely imports here -- so this
+# gets real, not just correct-by-construction, verification.
+
+import inspect
+
+import mt_compat
+
+
+def _fresh_onnx_shim():
+    # Each call to ensure_transformers_onnx_shim() early-returns if
+    # transformers.onnx.utils is already importable, so force a fresh
+    # shim by clearing any previous run's entries first.
+    sys.modules.pop("transformers.onnx", None)
+    sys.modules.pop("transformers.onnx.utils", None)
+    mt_compat.ensure_transformers_onnx_shim()
+    return sys.modules["transformers.onnx"], sys.modules["transformers.onnx.utils"]
+
+
+def test_onnx_shim_file_attribute_is_a_real_string():
+    # Root cause of a real bug hit on Kaggle 2026-08-17: the shim's
+    # __getattr__ used to auto-synthesize a *class* for __file__ (and any
+    # other dunder), which crashed unrelated code (Python's own `inspect`
+    # module, invoked transitively by torch._dynamo while just importing
+    # transformers.modeling_utils) with `AttributeError: type object
+    # '__file__' has no attribute 'endswith'`.
+    onnx_shim, utils_shim = _fresh_onnx_shim()
+    assert isinstance(onnx_shim.__file__, str)
+    assert isinstance(utils_shim.__file__, str)
+
+
+def test_onnx_shim_survives_real_inspect_getsourcefile():
+    # This is the literal function that crashed in the real traceback
+    # (inspect.getsourcefile -> filename.endswith(...) on a synthesized
+    # class instead of a string) -- exercised for real here, not mocked.
+    onnx_shim, utils_shim = _fresh_onnx_shim()
+    assert inspect.getsourcefile(onnx_shim) is None or isinstance(inspect.getsourcefile(onnx_shim), str)
+    assert inspect.getabsfile(onnx_shim)  # must not raise
+
+
+def test_onnx_shim_unset_dunder_attributes_report_false_via_hasattr():
+    # Any dunder the shim never explicitly sets, and that a bare
+    # types.ModuleType doesn't define by default either, must behave like a
+    # normal module that lacks it (hasattr -> False) -- not silently
+    # synthesize a fake class for it. (__loader__/__spec__/__package__ are
+    # real attributes types.ModuleType defines as None by default, so
+    # they're excluded here; __file__ is handled explicitly by the shim,
+    # covered by test_onnx_shim_file_attribute_is_a_real_string above.)
+    onnx_shim, utils_shim = _fresh_onnx_shim()
+    assert hasattr(onnx_shim, "__path__") is True  # explicitly set by the shim itself
+    assert hasattr(utils_shim, "__path__") is False  # never set on the .utils submodule
+    assert hasattr(onnx_shim, "__nonsense_dunder_nobody_asked_for__") is False
+
+
+def test_onnx_shim_still_auto_synthesizes_non_dunder_attributes():
+    # Regression guard: the actual purpose of this shim is letting
+    # IndicTrans2's remote-code `from transformers.onnx.utils import
+    # SomeClass` style imports succeed with a permissive placeholder --
+    # that behavior must be untouched by the dunder fix above.
+    onnx_shim, utils_shim = _fresh_onnx_shim()
+    synthesized = utils_shim.SomeRandomExportClassIndicTrans2MightImport
+    assert isinstance(synthesized, type)
+    synthesized_instance = synthesized(1, 2, keyword="anything")  # _Permissive accepts any args
+    assert synthesized_instance is not None
+
+
+def test_onnx_shim_is_idempotent_and_safe_to_call_repeatedly():
+    mt_compat.ensure_transformers_onnx_shim()
+    mt_compat.ensure_transformers_onnx_shim()
+    import transformers.onnx.utils  # noqa: F401 -- must not raise on repeated calls

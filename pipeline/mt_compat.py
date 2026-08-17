@@ -172,13 +172,37 @@ def ensure_transformers_onnx_shim():
 
     class _AutoAttrModule(types.ModuleType):
         def __getattr__(self, name):
+            if name.startswith("__") and name.endswith("__"):
+                # Never auto-synthesize dunder/special attributes. Doing so
+                # broke unrelated code that generically introspects
+                # sys.modules — hit for real on Kaggle, 2026-08-17:
+                # transformers.modeling_utils's own import (nothing to do
+                # with IndicTrans2/ONNX) pulls in torch._dynamo, whose
+                # custom-op registration calls inspect.getframeinfo ->
+                # findsource -> getmodule, which iterates every entry in
+                # sys.modules and reads `.__file__` off each one. Since this
+                # shim is registered in sys.modules (see below), that
+                # touched this __getattr__, which synthesized a *class*
+                # named "__file__" (a `type(name, ...)` call, not a
+                # string) — Python's inspect module then called
+                # `filename.endswith(...)` on that class and crashed with
+                # `AttributeError: type object '__file__' has no attribute
+                # 'endswith'`. Raising AttributeError here instead makes
+                # `hasattr(shim, '__whatever__')` correctly report False for
+                # anything not explicitly set below, same as any real
+                # module with an unset dunder — only non-dunder names
+                # (the actual classes/functions IndicTrans2's remote code
+                # imports from transformers.onnx/.utils) still auto-synthesize.
+                raise AttributeError(name)
             value = type(name, (_Permissive,), {})
             setattr(self, name, value)
             return value
 
     onnx_shim = _AutoAttrModule("transformers.onnx")
+    onnx_shim.__file__ = "<catla_transformers_onnx_shim>"  # real string, not synthesized
     onnx_shim.__path__ = []  # mark as a package so `transformers.onnx.utils` resolves
     utils_shim = _AutoAttrModule("transformers.onnx.utils")
+    utils_shim.__file__ = "<catla_transformers_onnx_shim>"
     onnx_shim.utils = utils_shim
 
     sys.modules["transformers.onnx"] = onnx_shim
