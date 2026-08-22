@@ -209,6 +209,18 @@ def main():
                          "the variable: if a run with this flag set trains with a sane, non-zero "
                          "loss, that confirms the toolkit integration (not something else "
                          "entirely) is the real cause, cheaply, without waiting on a full run.")
+    p.add_argument("--no_fp16", action="store_true",
+                    help="Train in full fp32 instead of fp16 mixed precision. Diagnostic/fallback: "
+                         "IndicTrans2 bn2en (the ai4bharat/indictrans2-indic-en-1B checkpoint "
+                         "specifically) has produced loss=0/grad_norm=nan on every attempt so far "
+                         "(2026-08-22) -- resumed, fresh-init, with IndicTransToolkit's real "
+                         "preprocessing, and with it disabled entirely -- while IndicTrans2 en2bn "
+                         "(the separate indictrans2-en-indic-1B checkpoint, same architecture, "
+                         "different pretrained weights) has never failed under the exact same fp16 "
+                         "setup. That pattern points at the indic-en-1B checkpoint's own weights "
+                         "being numerically fragile under fp16's limited dynamic range, independent "
+                         "of data or preprocessing. fp32 has far more headroom before overflow, at "
+                         "the cost of slower training and more memory.")
     p.add_argument("--use_4bit", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--push_to_hub", default=None, help="HF Hub repo id to push checkpoints to")
@@ -335,7 +347,7 @@ def main():
         learning_rate=args.lr,
         warmup_ratio=args.warmup_ratio,
         max_grad_norm=1.0,
-        fp16=True,
+        fp16=not args.no_fp16,
         gradient_checkpointing=True,
         save_steps=args.save_steps,
         save_total_limit=3,
