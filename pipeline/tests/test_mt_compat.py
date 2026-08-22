@@ -162,3 +162,65 @@ def test_onnx_shim_is_idempotent_and_safe_to_call_repeatedly():
     mt_compat.ensure_transformers_onnx_shim()
     mt_compat.ensure_transformers_onnx_shim()
     import transformers.onnx.utils  # noqa: F401 -- must not raise on repeated calls
+
+
+# ---- ensure_indictranstoolkit_import_compat() ----
+# Real bug hit on Kaggle, 2026-08-22, training IndicTrans2 on the full
+# dataset: IndicTransToolkit==1.1.1's own collator.py does
+# `from transformers.tokenization_utils import PreTrainedTokenizerBase`
+# inside the IndicDataCollator class body, but that class genuinely lives
+# in transformers.tokenization_utils_base against the installed
+# transformers release, breaking IndicTransToolkit's own package import
+# entirely (collator.py is imported by IndicTransToolkit/__init__.py
+# before this project ever reaches IndicProcessor, the only class it
+# actually uses). Verified for real against the actual PyPI wheel's
+# source (indictranstoolkit-1.1.1-cp312-cp312-manylinux_2_17_x86_64...),
+# not a hand-written reproduction of the bug -- see the shim's own
+# docstring in mt_compat.py for exactly how that was confirmed.
+
+
+def test_indictranstoolkit_shim_exposes_pretrainedtokenizerbase():
+    import transformers.tokenization_utils as tu
+
+    # Simulate the real installed-transformers shape this bug depends on:
+    # PreTrainedTokenizerBase genuinely absent from tokenization_utils.
+    had_attr = hasattr(tu, "PreTrainedTokenizerBase")
+    if had_attr:
+        saved = tu.PreTrainedTokenizerBase
+        del tu.PreTrainedTokenizerBase
+
+    try:
+        assert not hasattr(tu, "PreTrainedTokenizerBase")
+        mt_compat.ensure_indictranstoolkit_import_compat()
+        assert hasattr(tu, "PreTrainedTokenizerBase")
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase as real_cls
+        assert tu.PreTrainedTokenizerBase is real_cls
+    finally:
+        if had_attr:
+            tu.PreTrainedTokenizerBase = saved
+
+
+def test_indictranstoolkit_shim_is_idempotent_and_safe_to_call_repeatedly():
+    mt_compat.ensure_indictranstoolkit_import_compat()
+    mt_compat.ensure_indictranstoolkit_import_compat()
+    from transformers.tokenization_utils import PreTrainedTokenizerBase  # noqa: F401
+
+
+def test_indictranstoolkit_shim_does_not_override_a_real_existing_attribute():
+    # If a future transformers release re-adds PreTrainedTokenizerBase to
+    # tokenization_utils itself, the shim must not clobber it with a
+    # different object -- it only fills the gap, never overwrites.
+    import transformers.tokenization_utils as tu
+
+    sentinel = object()
+    had_attr = hasattr(tu, "PreTrainedTokenizerBase")
+    saved = getattr(tu, "PreTrainedTokenizerBase", None)
+    tu.PreTrainedTokenizerBase = sentinel
+    try:
+        mt_compat.ensure_indictranstoolkit_import_compat()
+        assert tu.PreTrainedTokenizerBase is sentinel
+    finally:
+        if had_attr:
+            tu.PreTrainedTokenizerBase = saved
+        else:
+            del tu.PreTrainedTokenizerBase

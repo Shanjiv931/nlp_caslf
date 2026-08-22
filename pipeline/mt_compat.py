@@ -46,6 +46,52 @@ def adapter_repo_id(engine_key, direction, prefix=DEFAULT_HF_ADAPTER_PREFIX):
 # the full investigation into why this can fail to install/import.
 # ---------------------------------------------------------------------------
 
+def ensure_indictranstoolkit_import_compat():
+    """IndicTransToolkit==1.1.1's own collator.py (bundled inside the
+    published wheel, confirmed by downloading and extracting
+    indictranstoolkit-1.1.1-cp312-cp312-manylinux_2_17_x86_64...whl — the
+    exact wheel a Linux/Python-3.12 environment like Kaggle's actually
+    installs) does `from transformers.tokenization_utils import
+    PreTrainedTokenizerBase` inside its `IndicDataCollator` class body, so
+    it runs the moment that class is defined — i.e. at
+    IndicTransToolkit/__init__.py's own import time, before this project
+    ever reaches the one class it actually uses (`IndicProcessor`).
+    `PreTrainedTokenizerBase` genuinely lives in
+    `transformers.tokenization_utils_base`, not `transformers.
+    tokenization_utils`, against whatever transformers release is
+    actually installed (confirmed directly: `hasattr(transformers.
+    tokenization_utils_base, "PreTrainedTokenizerBase")` is True,
+    `hasattr(transformers.tokenization_utils, "PreTrainedTokenizerBase")`
+    is False, on transformers 5.14.1). This is a real bug in
+    IndicTransToolkit's own code, unrelated to the indic-nlp-library /
+    indic-nlp-library-itt namespace collision already fixed in
+    requirements.txt — that fix is necessary but not sufficient on its
+    own, since this is a second, independent break in the same package.
+    Hit for real on Kaggle, 2026-08-22, training IndicTrans2 on the full
+    dataset: `ImportError: cannot import name 'PreTrainedTokenizerBase'
+    from 'transformers.tokenization_utils'`.
+
+    Fixed by aliasing the real class into the module IndicTransToolkit's
+    collator.py actually imports from, before that import ever runs —
+    same pattern as ensure_transformers_onnx_shim below. Must run at this
+    module's own import time (not deferred into ensure_all_compat_shims,
+    which callers only invoke later): the IndicTransToolkit import attempt
+    immediately below happens the moment mt_compat.py itself is first
+    imported by anything.
+    """
+    try:
+        import transformers.tokenization_utils as _tu
+        if not hasattr(_tu, "PreTrainedTokenizerBase"):
+            from transformers.tokenization_utils_base import PreTrainedTokenizerBase as _PTB
+            _tu.PreTrainedTokenizerBase = _PTB
+    except Exception:
+        pass  # if this itself fails, the real IndicTransToolkit import below
+        # surfaces its own real error, exactly as it did before this fix
+        # existed — never silently swallowed.
+
+
+ensure_indictranstoolkit_import_compat()
+
 try:
     from IndicTransToolkit.processor import IndicProcessor
     HAS_INDIC_TOOLKIT = True
@@ -282,3 +328,6 @@ def ensure_all_compat_shims():
     whether it's already applied/needed before doing anything."""
     ensure_transformers_onnx_shim()
     ensure_tie_weights_compat()
+    ensure_indictranstoolkit_import_compat()  # already ran at module import
+    # time too (see its own docstring); calling again here is a harmless
+    # no-op, kept only for consistency with the other shims in this function.

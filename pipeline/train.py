@@ -167,6 +167,14 @@ def main():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--warmup_ratio", type=float, default=0.03,
+                    help="Fraction of total steps spent ramping the learning rate up from 0 to "
+                         "--lr, rather than applying full strength from step 1. Matters most when "
+                         "--resume picks up an already fine-tuned adapter from the Hub (not a "
+                         "fresh LoRA init) -- slamming a full, un-ramped LR onto weights that are "
+                         "already near a good optimum is a real, hit-for-real way to blow up fp16 "
+                         "gradients to inf/nan on the very first step. Applies even on a fresh "
+                         "init, where it's just standard practice, not just the resume case.")
     p.add_argument("--max_len", type=int, default=128)
     p.add_argument("--max_train_rows", type=int, default=None)
     p.add_argument("--save_steps", type=int, default=500)
@@ -271,6 +279,8 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
+        warmup_ratio=args.warmup_ratio,
+        max_grad_norm=1.0,
         fp16=True,
         gradient_checkpointing=True,
         save_steps=args.save_steps,
