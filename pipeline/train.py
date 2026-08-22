@@ -220,7 +220,30 @@ def main():
             # "exists" but has no adapter_config.json). Actually attempt the load
             # and fall back on failure, instead of guessing in advance.
             try:
-                model = PeftModel.from_pretrained(model, args.push_to_hub, is_trainable=True)
+                import torch
+                _resumed_model = PeftModel.from_pretrained(model, args.push_to_hub, is_trainable=True)
+                # A checkpoint can "exist" on the Hub at the right file size and still
+                # be worthless: a real, confirmed failure mode (2026-08-22) is a prior
+                # unstable training run silently writing an adapter where every single
+                # value in every tensor is NaN (576/576 tensors, 17,694,720/17,694,720
+                # params, for catla-indictrans2-bn2en specifically) -- resuming from
+                # that guarantees every subsequent forward pass is NaN too, regardless
+                # of learning rate or warmup, since NaN parameters never recover once
+                # loaded. File-existence/size checks (used everywhere else in this
+                # project to verify a training run) never catch this; only actually
+                # inspecting the values does. Only the LoRA delta params are checked
+                # (not the frozen base model) -- cheap, and the only params a broken
+                # training run could actually have corrupted.
+                _bad_params = [name for name, p in _resumed_model.named_parameters()
+                               if "lora_" in name and (torch.isnan(p).any() or torch.isinf(p).any())]
+                if _bad_params:
+                    raise ValueError(
+                        f"resumed adapter from {args.push_to_hub} contains NaN/Inf in "
+                        f"{len(_bad_params)} of its parameter tensors (e.g. {_bad_params[0]}) — "
+                        f"a previous training run silently corrupted this checkpoint. Refusing "
+                        f"to resume from it."
+                    )
+                model = _resumed_model
                 print(f"no local checkpoint in {args.output_dir} — resumed LoRA weights from Hub "
                       f"repo {args.push_to_hub} instead (approximate resume: optimizer/LR-schedule "
                       f"state restarts, learned weights carry over)")
@@ -229,8 +252,15 @@ def main():
                 print(f"--resume given, but Hub repo {args.push_to_hub} has no usable adapter "
                       f"checkpoint yet (commonly because Trainer's push_to_hub=True creates the "
                       f"repo immediately at startup, before any checkpoint is pushed — e.g. a "
-                      f"previous run that crashed before reaching --save_steps) — starting fresh. "
-                      f"({type(e).__name__}: {e})")
+                      f"previous run that crashed before reaching --save_steps — or because the "
+                      f"checkpoint that IS there is corrupted, e.g. all-NaN weights from an "
+                      f"earlier unstable run) — starting fresh. ({type(e).__name__}: {e})")
+                # Reload a clean base model rather than reusing `model`: the rejected
+                # PeftModel.from_pretrained() attempt above may have already attached
+                # LoRA modules onto this same underlying object before the NaN check
+                # ran, and get_peft_model() below expects an unwrapped base model, not
+                # one PEFT has already touched.
+                model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
         if not loaded_from_hub:
             model = get_peft_model(model, build_lora_config(args))
     model.print_trainable_parameters()
