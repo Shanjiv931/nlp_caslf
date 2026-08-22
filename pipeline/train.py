@@ -131,7 +131,19 @@ def build_preprocess_fn(tokenizer, direction, max_len, indic_processor, is_indic
         targets = batch["target"]
         if indic_processor is not None:
             sources = indic_processor.preprocess_batch(sources, src_lang=src_lang_code, tgt_lang=tgt_lang_code)
-            targets = indic_processor.preprocess_batch(targets, src_lang=tgt_lang_code, tgt_lang=src_lang_code)
+            # is_target=True here is not optional decoration -- IndicProcessor's own
+            # _preprocess() (confirmed by reading the real source, processor.pyx)
+            # prepends "{src_lang} {tgt_lang} " to its output UNLESS is_target=True.
+            # Without it (the bug this replaces), the label text handed to the
+            # decoder would itself start with two language-tag tokens, i.e. the
+            # model would be trained to predict a tag prefix as part of its own
+            # output -- never how tag_indictrans2_text's fallback works, and not a
+            # real seq2seq label contract either. Found while investigating a
+            # loss=0/grad_norm=nan run that persisted even with a fresh LoRA init
+            # and a confirmed-active warmup (2026-08-22) -- both of which ruled out
+            # every other suspected cause, leaving this as the one code path that's
+            # never actually run for real in this project before now.
+            targets = indic_processor.preprocess_batch(targets, src_lang=tgt_lang_code, tgt_lang=src_lang_code, is_target=True)
         elif is_indictrans2:
             # IndicTransTokenizer._src_tokenize() requires every input to
             # already start with "{src_lang} {tgt_lang} " -- normally
@@ -186,6 +198,17 @@ def main():
                          "use HF's 'q,k,v,o' attention naming (NOT 'q_proj'/'v_proj', which "
                          "only exist on M2M100/NLLB/IndicTrans2-style architectures) — mixing "
                          "these up silently attaches LoRA to zero modules.")
+    p.add_argument("--disable_indic_toolkit", action="store_true",
+                    help="Force the tag_indictrans2_text fallback even if IndicTransToolkit "
+                         "imports successfully. Diagnostic escape hatch: IndicProcessor's real "
+                         "preprocessing path has never run in a successful training in this "
+                         "project before 2026-08-22, and that's also the first time loss=0/"
+                         "grad_norm=nan showed up on a fresh LoRA init with warmup confirmed "
+                         "active -- both other suspected causes (resume corruption, LR shock) "
+                         "were ruled out with direct evidence. This flag isolates the toolkit as "
+                         "the variable: if a run with this flag set trains with a sane, non-zero "
+                         "loss, that confirms the toolkit integration (not something else "
+                         "entirely) is the real cause, cheaply, without waiting on a full run.")
     p.add_argument("--use_4bit", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--push_to_hub", default=None, help="HF Hub repo id to push checkpoints to")
@@ -269,7 +292,8 @@ def main():
     is_nllb = "nllb" in args.model_name.lower()
     src_lang_code, tgt_lang_code = direction_lang_codes(args.direction)
 
-    indic_processor = get_indic_processor(inference=False) if is_indictrans2 else None
+    indic_processor = (get_indic_processor(inference=False)
+                       if is_indictrans2 and not args.disable_indic_toolkit else None)
     if is_indictrans2 and indic_processor is None:
         reason = _INDIC_TOOLKIT_IMPORT_ERROR or "unknown (import raised no captured exception, unexpected)"
         print("WARNING: IndicTransToolkit unavailable — falling back to plain tokenization for IndicTrans2. "
