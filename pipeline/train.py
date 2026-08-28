@@ -111,6 +111,36 @@ def find_latest_checkpoint(output_dir):
     return max(ckpts, key=lambda p: int(p.rsplit("-", 1)[-1]))
 
 
+def find_nan_lora_params(peft_model):
+    """Return the names of every LoRA parameter tensor containing NaN/Inf.
+
+    A checkpoint can "exist" at the right file size/shape and still be
+    worthless: a real, confirmed failure mode (2026-08-22) is an unstable
+    training run silently writing an adapter where every single value in
+    every tensor is NaN (576/576 tensors, 17,694,720/17,694,720 params, for
+    catla-indictrans2-bn2en specifically) -- resuming from that guarantees
+    every subsequent forward pass is NaN too, regardless of learning rate or
+    warmup, since NaN parameters never recover once loaded. File-existence/
+    size checks (used everywhere else in this project to verify a training
+    run) never catch this; only actually inspecting the values does. Only
+    the LoRA delta params are checked (not the frozen base model) -- cheap,
+    and the only params a broken training run could actually have corrupted.
+
+    Used for BOTH resume paths (local checkpoint and Hub fallback, see
+    module docstring) -- a corrupted checkpoint is corrupted regardless of
+    which of the two places it was loaded from, and only checking one path
+    (as an earlier version of this script did) leaves the other free to
+    silently burn an entire GPU-hour quota re-training on top of NaN
+    weights, producing `loss: 0, grad_norm: nan` at every single step with
+    no early warning -- exactly what happened resuming from a local
+    checkpoint-3000 on 2026-08-23, which this check would have caught in
+    seconds instead.
+    """
+    import torch
+    return [name for name, p in peft_model.named_parameters()
+            if "lora_" in name and (torch.isnan(p).any() or torch.isinf(p).any())]
+
+
 def build_lora_config(args):
     target_modules = (
         args.lora_target_modules.split(",") if args.lora_target_modules
@@ -209,6 +239,20 @@ def main():
                          "the variable: if a run with this flag set trains with a sane, non-zero "
                          "loss, that confirms the toolkit integration (not something else "
                          "entirely) is the real cause, cheaply, without waiting on a full run.")
+    p.add_argument("--no_gradient_checkpointing", action="store_true",
+                    help="Disable gradient checkpointing. Diagnostic: every single IndicTrans2 "
+                         "bn2en attempt so far (7 in a row, 2026-08-22, every combination of "
+                         "resume/fresh-init, toolkit on/off, is_target fixed, fp16/fp32, full/"
+                         "150k-row data) has logged grad_norm: nan on every logged step without "
+                         "exception, and every one of those logs has also carried this exact "
+                         "transformers warning, unchanged: 'You are using an old version of the "
+                         "checkpointing format that is deprecated ... _set_gradient_checkpointing'. "
+                         "That's AI4Bharat's custom modeling_indictrans.py using an old-style "
+                         "checkpointing hook current transformers/accelerate explicitly flags as "
+                         "deprecated -- the one variable that's been constant across every attempt "
+                         "and never actually been turned off. Costs more GPU memory (no more "
+                         "activation recomputation), which is a real OOM risk on a T4 for a 1B "
+                         "model -- if it OOMs, that's still useful information, fast.")
     p.add_argument("--no_fp16", action="store_true",
                     help="Train in full fp32 instead of fp16 mixed precision. Diagnostic/fallback: "
                          "IndicTrans2 bn2en (the ai4bharat/indictrans2-indic-en-1B checkpoint "
@@ -242,11 +286,39 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
 
+    loaded_from_hub = False
+    local_resume_ok = False
     if resume_path:
-        print(f"resuming LoRA weights + optimizer/scheduler state from local checkpoint {resume_path}")
-        model = PeftModel.from_pretrained(model, resume_path, is_trainable=True)
-    else:
-        loaded_from_hub = False
+        # Check the local checkpoint for NaN/Inf BEFORE trusting it, exactly like
+        # the Hub-fallback path below already does -- this local path used to load
+        # unconditionally with zero corruption checking, which is a real gap: a
+        # corrupted local checkpoint-N (e.g. one written by an earlier unstable
+        # segment of the SAME run, before this script's warmup/is_target fixes
+        # existed, or simply resumed on top of an already-NaN adapter) produces
+        # `loss: 0, grad_norm: nan` at literally every logged step with no early
+        # warning, silently burning the whole GPU-hour quota re-training on top of
+        # dead weights. See find_nan_lora_params()'s docstring for the exact
+        # 2026-08-23 run this was caught from.
+        _resumed_model = PeftModel.from_pretrained(model, resume_path, is_trainable=True)
+        _bad_params = find_nan_lora_params(_resumed_model)
+        if _bad_params:
+            print(f"local checkpoint {resume_path} contains NaN/Inf in {len(_bad_params)} of its "
+                  f"parameter tensors (e.g. {_bad_params[0]}) — a previous training run silently "
+                  f"corrupted this checkpoint. Refusing to resume from it; falling back to the Hub "
+                  f"checkpoint (if any) or a fresh LoRA init instead.")
+            resume_path = None  # so trainer.train() below doesn't also try to load it
+            # Reload a clean base model: the rejected PeftModel.from_pretrained() call
+            # above may have already attached LoRA modules onto this same underlying
+            # object before the NaN check ran, and both the Hub-fallback path and
+            # get_peft_model() below expect an unwrapped base model, not one PEFT has
+            # already touched.
+            model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
+        else:
+            model = _resumed_model
+            print(f"resuming LoRA weights + optimizer/scheduler state from local checkpoint {resume_path}")
+            local_resume_ok = True
+
+    if not local_resume_ok:
         if args.resume and args.push_to_hub:
             # Don't just check the Hub repo *exists* — Trainer's push_to_hub=True
             # creates the repo the moment Trainer is constructed, well before any
@@ -255,22 +327,8 @@ def main():
             # "exists" but has no adapter_config.json). Actually attempt the load
             # and fall back on failure, instead of guessing in advance.
             try:
-                import torch
                 _resumed_model = PeftModel.from_pretrained(model, args.push_to_hub, is_trainable=True)
-                # A checkpoint can "exist" on the Hub at the right file size and still
-                # be worthless: a real, confirmed failure mode (2026-08-22) is a prior
-                # unstable training run silently writing an adapter where every single
-                # value in every tensor is NaN (576/576 tensors, 17,694,720/17,694,720
-                # params, for catla-indictrans2-bn2en specifically) -- resuming from
-                # that guarantees every subsequent forward pass is NaN too, regardless
-                # of learning rate or warmup, since NaN parameters never recover once
-                # loaded. File-existence/size checks (used everywhere else in this
-                # project to verify a training run) never catch this; only actually
-                # inspecting the values does. Only the LoRA delta params are checked
-                # (not the frozen base model) -- cheap, and the only params a broken
-                # training run could actually have corrupted.
-                _bad_params = [name for name, p in _resumed_model.named_parameters()
-                               if "lora_" in name and (torch.isnan(p).any() or torch.isinf(p).any())]
+                _bad_params = find_nan_lora_params(_resumed_model)
                 if _bad_params:
                     raise ValueError(
                         f"resumed adapter from {args.push_to_hub} contains NaN/Inf in "
@@ -279,8 +337,8 @@ def main():
                         f"to resume from it."
                     )
                 model = _resumed_model
-                print(f"no local checkpoint in {args.output_dir} — resumed LoRA weights from Hub "
-                      f"repo {args.push_to_hub} instead (approximate resume: optimizer/LR-schedule "
+                print(f"no usable local checkpoint in {args.output_dir} — resumed LoRA weights from "
+                      f"Hub repo {args.push_to_hub} instead (approximate resume: optimizer/LR-schedule "
                       f"state restarts, learned weights carry over)")
                 loaded_from_hub = True
             except Exception as e:
@@ -348,7 +406,7 @@ def main():
         warmup_ratio=args.warmup_ratio,
         max_grad_norm=1.0,
         fp16=not args.no_fp16,
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
         save_steps=args.save_steps,
         save_total_limit=3,
         eval_strategy="steps",
