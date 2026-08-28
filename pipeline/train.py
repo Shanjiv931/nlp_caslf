@@ -62,6 +62,7 @@ from transformers import (
     DataCollatorForSeq2Seq,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
 )
 
 from mt_compat import (
@@ -139,6 +140,58 @@ def find_nan_lora_params(peft_model):
     import torch
     return [name for name, p in peft_model.named_parameters()
             if "lora_" in name and (torch.isnan(p).any() or torch.isinf(p).any())]
+
+
+class NaNGuardCallback(TrainerCallback):
+    """Abort training as soon as it's clearly gone permanently NaN.
+
+    find_nan_lora_params() (above) only catches corruption AT RESUME TIME --
+    it can't help a run that starts on genuinely clean weights and goes NaN
+    partway through, e.g. one unstable fp16 optimizer step that GradScaler
+    fails to skip. That's a real, confirmed cost, not a hypothetical one: a
+    2026-08-23 run resumed cleanly, then showed `loss: 0, grad_norm: nan` at
+    every logged step from roughly the 3000-step mark onward, and (having no
+    early-stop guard) kept running for another ~1700 steps and ~25 minutes,
+    pushing the now-dead adapter to the Hub at every intervening --save_steps
+    checkpoint along the way -- pure wasted GPU-hour quota once it entered
+    that state, since a NaN-poisoned LoRA weight never recovers on its own
+    (the whole point of find_nan_lora_params existing at all).
+
+    Trigger condition: `patience` CONSECUTIVE logging_steps intervals where
+    grad_norm is NaN/Inf. grad_norm alone (not loss) is the signal, because
+    loss has shown up as exactly 0.0 in this project's own logs during
+    NaN-weight episodes (a known separate PyTorch quirk: cross-entropy with
+    every label in a window masked to ignore_index can legitimately return
+    a clean 0.0, not NaN) -- grad_norm has no equivalent legitimate-zero
+    case this project has seen, and requiring several consecutive bad
+    windows (not just one) avoids aborting on a single noisy step early in
+    training, before warmup has fully ramped, when an occasional skipped
+    GradScaler step is normal and recoverable.
+    """
+    def __init__(self, patience=3):
+        self.patience = patience
+        self._consecutive_bad = 0
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or "grad_norm" not in logs:
+            return control
+        grad_norm = logs["grad_norm"]
+        is_bad = grad_norm is None or grad_norm != grad_norm or grad_norm in (float("inf"), float("-inf"))
+        if is_bad:
+            self._consecutive_bad += 1
+        else:
+            self._consecutive_bad = 0
+        if self._consecutive_bad >= self.patience:
+            print(f"NaNGuardCallback: grad_norm has been NaN/Inf for {self._consecutive_bad} "
+                  f"consecutive logged steps (step {state.global_step}) — this pattern has never "
+                  f"recovered on its own in this project's training history, so continuing would "
+                  f"just burn GPU-hour quota producing more of the same. Stopping training now "
+                  f"instead of running to completion. The resulting checkpoint is still corrupted "
+                  f"and should NOT be trusted — resume with --resume to fall back to the last known "
+                  f"clean local/Hub checkpoint (find_nan_lora_params will reject this one), or drop "
+                  f"--resume for a fresh LoRA init.")
+            control.should_training_stop = True
+        return control
 
 
 def build_lora_config(args):
@@ -432,14 +485,30 @@ def main():
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
+        callbacks=[NaNGuardCallback()],
         **{tok_kwarg: tokenizer},
     )
 
     trainer.train(resume_from_checkpoint=resume_path if resume_path else None)
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    if args.push_to_hub:
-        trainer.push_to_hub()
+
+    # Final safety net: NaNGuardCallback stops training early once it detects
+    # permanent NaN/Inf, but doesn't by itself prevent the corrupted in-memory
+    # model from being saved/pushed one more time right here. Checking again on
+    # the live `model` object is free (no download needed, unlike
+    # find_nan_lora_params's other two call sites) and closes the loop: it's
+    # the difference between a corrupted final push happening (2026-08-23,
+    # before this check existed) and being refused with a clear reason.
+    _final_bad_params = find_nan_lora_params(model)
+    if _final_bad_params:
+        print(f"REFUSING to save/push the final model — {len(_final_bad_params)} of its LoRA "
+              f"parameter tensors are NaN/Inf (e.g. {_final_bad_params[0]}), the same corruption "
+              f"find_nan_lora_params checks for at resume time. This training run did not "
+              f"produce anything usable; do not treat local/Hub state from this run as valid.")
+    else:
+        model.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        if args.push_to_hub:
+            trainer.push_to_hub()
 
 
 if __name__ == "__main__":
