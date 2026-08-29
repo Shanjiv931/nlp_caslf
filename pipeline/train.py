@@ -80,10 +80,41 @@ from mt_compat import (
 PROCESSED = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
 
+MAX_ROW_CHARS = 500  # see load_direction_dataset's docstring for why
+
+
 def load_direction_dataset(path, direction, max_rows=None):
     """direction: 'bn2en' or 'en2bn'. Only bn_en_translation pair_type rows
     are used for MT fine-tuning (transliteration/hashtag/monolingual rows
-    are excluded — they're for other pipeline components, not this task)."""
+    are excluded — they're for other pipeline components, not this task).
+
+    Also drops any row where either side exceeds MAX_ROW_CHARS (500) raw
+    characters, BEFORE tokenizer truncation -- found by directly scanning
+    train.jsonl (2026-08-29) after a full-572k-row run hit `loss: 1.796e+05,
+    grad_norm: nan` at literally the first logged step, even under fp32
+    (ruling out fp16 dynamic range as the cause -- see train.py's --no_fp16
+    docstring, now superseded by this finding). 99.14% of this dataset's
+    rows are already within Twitter's real 280-char limit -- genuine tweets.
+    But the tail is real contamination, not just long tweets: 61 rows exceed
+    1000 characters, several in the multi-thousand range, up to one row at
+    20,193 characters -- and inspecting their content shows scraped
+    Wikipedia-style infobox/table dumps (district listings, award lists,
+    school directories) that in several cases aren't even source/target
+    translations of each other. tokenizer(..., truncation=True,
+    max_length=max_len) already caps what actually reaches the model at
+    128 tokens, so this isn't strictly needed to prevent an OOM or a
+    position-embedding overflow -- but training on a garbage 128-token
+    fragment of a 20,193-character mismatched table, as if it were a real
+    translation pair, is exactly the kind of example that could plausibly
+    produce genuinely extreme loss/gradient values, and even if it turns
+    out not to be the full explanation for this specific NaN episode, it's
+    real, disclosed-worthy data contamination in a dataset whose entire
+    premise (see FINAL_REPORT.md, mt_compat.py) is "tweet-length text" --
+    worth excluding on its own merits. Cutoff chosen generously (500, well
+    above the 280-char platform limit) specifically to avoid discarding any
+    genuine longer-form tweet content: this removes 649/572,703 rows
+    (0.11%), not a meaningful data-loss concern at this scale.
+    """
     rows = []
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -91,6 +122,8 @@ def load_direction_dataset(path, direction, max_rows=None):
             if row.get("pair_type") != "bn_en_translation":
                 continue
             if not row.get("text") or not row.get("parallel_text"):
+                continue
+            if len(row["text"]) > MAX_ROW_CHARS or len(row["parallel_text"]) > MAX_ROW_CHARS:
                 continue
             if direction == "bn2en":
                 src, tgt = row["text"], row["parallel_text"]  # text is bn, parallel_text is en
