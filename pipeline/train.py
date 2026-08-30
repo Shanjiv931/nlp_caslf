@@ -281,6 +281,99 @@ def build_preprocess_fn(tokenizer, direction, max_len, indic_processor, is_indic
     return preprocess
 
 
+class NaNBatchDebugTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer subclass that captures the exact micro-batch whose
+    backward pass FIRST turns a LoRA gradient into NaN/Inf, and prints its
+    decoded source/target text.
+
+    Every hypothesis tested in this project's IndicTrans2 bn2en investigation
+    (resumed corruption, LR warmup, IndicProcessor's is_target bug, fp16
+    precision, outlier data rows >500 chars, gradient checkpointing's
+    deprecated hook) has been ruled out or only shifted when the failure
+    happens, never prevented it. `NaNGuardCallback` catches the SYMPTOM
+    (grad_norm: nan in the aggregate log) cheaply, but the log's grad_norm
+    is a single scalar for the whole optimizer step and can't say which of
+    the `--grad_accum` micro-batches inside it was responsible, or what was
+    actually in it. This answers that directly instead of guessing an 8th
+    hypothesis: checks every LoRA parameter's `.grad` for NaN/Inf right
+    after each micro-batch's backward pass (inside `training_step`, which is
+    the one Trainer hook that still has the actual `inputs` tensors), and
+    the FIRST time it flips from clean to corrupted, decodes and prints that
+    exact micro-batch's source/target text plus its raw token length --
+    real ground truth on the next failure instead of another blind guess.
+    Only fires once per run (further NaN is expected once poisoned, not
+    newly informative).
+    """
+    def __init__(self, *args, debug_tokenizer=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._debug_tokenizer = debug_tokenizer
+        self._debug_dumped = False
+
+    def _lora_grads_are_bad(self):
+        import torch
+        for name, p in self.model.named_parameters():
+            if "lora_" in name and p.grad is not None:
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    return True
+        return False
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        was_bad = (not self._debug_dumped) and self._lora_grads_are_bad()
+        try:
+            loss = super().training_step(model, inputs, *args, **kwargs)
+        except RuntimeError:
+            # With --detect_anomaly on, torch.autograd raises immediately from
+            # INSIDE backward() the instant a NaN/Inf gradient is produced --
+            # execution never reaches the normal post-call check below in that
+            # case. Dump what we have (best-effort; the backward that just
+            # raised is the one that did it) before re-raising, so the batch
+            # that triggered it is captured right alongside the exact-op stack
+            # trace anomaly detection prints -- don't swallow that traceback,
+            # it's the whole point of turning detect_anomaly on.
+            if not self._debug_dumped:
+                self._dump_batch(inputs)
+                self._debug_dumped = True
+            raise
+        if not self._debug_dumped and not was_bad and self._lora_grads_are_bad():
+            self._dump_batch(inputs)
+            self._debug_dumped = True
+        return loss
+
+    def _dump_batch(self, inputs):
+        print("=" * 70)
+        print("NaNBatchDebugTrainer: LoRA gradients just turned NaN/Inf for the "
+              "FIRST time this run. This is the micro-batch whose backward pass "
+              "did it:")
+        tok = self._debug_tokenizer
+        input_ids = inputs.get("input_ids")
+        labels = inputs.get("labels")
+        if input_ids is None or tok is None:
+            print("(no input_ids/tokenizer available to decode -- skipping)")
+            print("=" * 70)
+            return
+        for i in range(input_ids.shape[0]):
+            src_ids = [t for t in input_ids[i].tolist() if t >= 0]
+            # Source ids were encoded with the SOURCE-side vocab (src_spm/
+            # src_encoder), but this tokenizer's own .decode() unconditionally
+            # switches to TARGET-side vocab first (see tokenization_indictrans.
+            # py's _decode) -- using it on source ids would silently decode
+            # through the wrong vocabulary. Map through src_decoder directly.
+            src_decoder = getattr(tok, "src_decoder", None)
+            if src_decoder is not None:
+                src_text = "".join(src_decoder.get(t, f"<id:{t}>") for t in src_ids).replace("▁", " ").strip()
+            else:
+                src_text = tok.decode(src_ids, skip_special_tokens=False)
+            print(f"  [{i}] source ({len(src_ids)} tokens): {src_text[:300]!r}")
+            if labels is not None:
+                lab_ids = labels[i].tolist()
+                pad_id = tok.pad_token_id or 0
+                lab_ids_clean = [t if t != -100 else pad_id for t in lab_ids]
+                n_real = sum(1 for t in lab_ids if t != -100)
+                tgt_text = tok.decode(lab_ids_clean, skip_special_tokens=False)
+                print(f"  [{i}] target ({n_real}/{len(lab_ids)} real tokens, rest masked): {tgt_text[:300]!r}")
+        print("=" * 70)
+
+
 def main():
     ensure_transformers_onnx_shim()
     ensure_tie_weights_compat()
@@ -354,9 +447,38 @@ def main():
     p.add_argument("--use_4bit", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--push_to_hub", default=None, help="HF Hub repo id to push checkpoints to")
+    p.add_argument("--seed", type=int, default=42,
+                    help="No seed was ever set anywhere in this script until 2026-08-30 -- every "
+                         "run got a fresh random LoRA init AND a different Trainer shuffle order, "
+                         "meaning no two of this project's many IndicTrans2 bn2en debugging runs "
+                         "were ever actually comparable, and a failure could never be reproduced "
+                         "on purpose to diagnose it further. Fixed: seeds Python/NumPy/torch via "
+                         "transformers.set_seed() before the LoRA adapter is created (so its random "
+                         "init is reproducible) and passes the same value to Seq2SeqTrainingArguments "
+                         "(so the dataset shuffle order is too). Same default (42) for every run "
+                         "unless overridden -- change it to deliberately test a different shuffle/"
+                         "init, not to work around a bug.")
+    p.add_argument("--detect_anomaly", action="store_true",
+                    help="Wrap trainer.train() in torch.autograd.set_detect_anomaly(True). This is "
+                         "the actual right tool for this project's still-unresolved IndicTrans2 "
+                         "bn2en NaN-gradient investigation, not another single-flag guess: every "
+                         "hypothesis tested so far (resumed corruption, LR warmup, the IndicProcessor "
+                         "is_target bug, fp16 precision, outlier data rows, gradient-checkpointing's "
+                         "deprecated hook) has been ruled out or only delayed the failure, never "
+                         "prevented it -- meaning grad_norm: nan is real, not a red herring. Autograd "
+                         "anomaly detection makes PyTorch raise immediately, AT the exact backward op "
+                         "that first produces the NaN, with a full stack trace naming that op and "
+                         "where it's called from in modeling_indictrans.py -- turning 'somewhere in "
+                         "the backward pass' into an exact line. Real, substantial slowdown (wraps "
+                         "every autograd Function on every step to check for NaN and retain extra "
+                         "traceback info) -- meant for a short diagnostic run to actually find the "
+                         "cause, not for the real training run once it's found.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    from transformers import set_seed
+    set_seed(args.seed)  # before any random LoRA init below -- see --seed's docstring
 
     quant_kwargs = {}
     if args.use_4bit:
@@ -497,6 +619,8 @@ def main():
         save_total_limit=3,
         eval_strategy="steps",
         eval_steps=args.save_steps,
+        seed=args.seed,
+        data_seed=args.seed,
         logging_steps=50,
         predict_with_generate=True,
         push_to_hub=bool(args.push_to_hub),
@@ -512,17 +636,26 @@ def main():
     import inspect
     tok_kwarg = "processing_class" if "processing_class" in inspect.signature(Seq2SeqTrainer.__init__).parameters else "tokenizer"
 
-    trainer = Seq2SeqTrainer(
+    trainer = NaNBatchDebugTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
         callbacks=[NaNGuardCallback()],
+        debug_tokenizer=tokenizer,
         **{tok_kwarg: tokenizer},
     )
 
-    trainer.train(resume_from_checkpoint=resume_path if resume_path else None)
+    if args.detect_anomaly:
+        import torch
+        print("--detect_anomaly is on: training will be substantially slower, and will raise "
+              "(not just log nan) with a full backward-op stack trace the instant a NaN/Inf "
+              "gradient is first produced.")
+        with torch.autograd.set_detect_anomaly(True):
+            trainer.train(resume_from_checkpoint=resume_path if resume_path else None)
+    else:
+        trainer.train(resume_from_checkpoint=resume_path if resume_path else None)
 
     # Final safety net: NaNGuardCallback stops training early once it detects
     # permanent NaN/Inf, but doesn't by itself prevent the corrupted in-memory
