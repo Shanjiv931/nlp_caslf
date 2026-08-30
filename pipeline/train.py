@@ -487,6 +487,28 @@ def main():
             load_in_4bit=True, bnb_4bit_compute_dtype="bfloat16", bnb_4bit_quant_type="nf4",
         )
 
+    if "indictrans2" in args.model_name.lower():
+        # Root-caused 2026-08-30 via torch.autograd.set_detect_anomaly: the crash is
+        # RuntimeError: Function 'LogSoftmaxBackward0' returned nan values, from
+        # modeling_indictrans.py's masked_lm_loss = F.cross_entropy(..., ignore_index=
+        # -100) -- and the exact micro-batch that triggered it (captured by
+        # NaNBatchDebugTrainer) was full of very short targets heavily padded to the
+        # batch max (5/16, 7/16, 8/16 real tokens -- "Bonghee!", "Go, go, go!").
+        # ignore_index only zeroes a masked position's LOSS contribution; it does NOT
+        # protect that position's GRADIENT if the logits feeding it are themselves
+        # pathological there, because 0 * nan = nan in IEEE floats, not 0. Reading
+        # modeling_indictrans.py directly confirms it implements HF's standard
+        # multi-backend attention selection (eager / SDPA / flash-attention-2, via
+        # _prepare_4d_causal_attention_mask_for_sdpa etc.) -- SDPA's fused kernel has
+        # well-documented NaN-with-padding edge cases on custom/ported models across
+        # PyTorch versions, especially with the short/heavily-padded sequences typical
+        # of tweet-length text. The plain eager attention path computes the masked
+        # softmax explicitly rather than through a fused kernel, and is the standard
+        # first mitigation for exactly this failure signature. IndicTrans2-specific
+        # only -- NLLB and BanglaT5 have never shown this failure, don't touch what
+        # isn't broken.
+        quant_kwargs["attn_implementation"] = "eager"
+
     resume_path = None  # local checkpoint dir, for exact Trainer-level resume
     if args.resume:
         resume_path = find_latest_checkpoint(args.output_dir)
