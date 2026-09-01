@@ -514,6 +514,7 @@ def main():
         resume_path = find_latest_checkpoint(args.output_dir)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    tokenizer.padding_side = "right"
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
 
     loaded_from_hub = False
