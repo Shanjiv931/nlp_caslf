@@ -77,6 +77,45 @@ from mt_compat import (
     tag_indictrans2_text,
 )
 
+
+class RightPadCollator:
+    """Manually right-pads input_ids/attention_mask/labels, bypassing
+    IndicTransTokenizer's own pad() entirely -- setting tokenizer.padding_side
+    did not change its behavior (confirmed 2026-09-01: batches were still
+    left-padded after that fix), so this collator no longer trusts the
+    tokenizer to pad correctly at all.
+    """
+    def __init__(self, tokenizer, model=None, label_pad_token_id=-100):
+        self.pad_token_id = tokenizer.pad_token_id
+        self.label_pad_token_id = label_pad_token_id
+        self.model = model
+
+    def __call__(self, features):
+        import torch
+        max_len = max(len(f["input_ids"]) for f in features)
+        max_label_len = max(len(f["labels"]) for f in features)
+
+        input_ids, attention_mask, labels = [], [], []
+        for f in features:
+            ids = list(f["input_ids"])
+            pad_n = max_len - len(ids)
+            input_ids.append(ids + [self.pad_token_id] * pad_n)
+            attention_mask.append([1] * len(ids) + [0] * pad_n)
+
+            lab = list(f["labels"])
+            lab_pad_n = max_label_len - len(lab)
+            labels.append(lab + [self.label_pad_token_id] * lab_pad_n)
+
+        batch = {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+        if self.model is not None and hasattr(self.model, "prepare_decoder_input_ids_from_labels"):
+            batch["decoder_input_ids"] = self.model.prepare_decoder_input_ids_from_labels(labels=batch["labels"])
+        return batch
+
+
 PROCESSED = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
 
@@ -625,7 +664,7 @@ def main():
     train_ds = train_ds.map(preprocess_fn, batched=True, remove_columns=["source", "target"])
     val_ds = val_ds.map(preprocess_fn, batched=True, remove_columns=["source", "target"])
 
-    collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+    collator = RightPadCollator(tokenizer, model=model)
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
