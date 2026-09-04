@@ -551,6 +551,22 @@ def main():
                          "(so the dataset shuffle order is too). Same default (42) for every run "
                          "unless overridden -- change it to deliberately test a different shuffle/"
                          "init, not to work around a bug.")
+    p.add_argument("--fp16_init_scale", type=float, default=1024.0,
+                    help="torch.cuda.amp.GradScaler's initial loss scale (PyTorch's own default is "
+                         "65536.0). Lowered because of a real, repeated failure mode (2026-09-04): "
+                         "--resume via the Hub-fallback path (see module docstring) restores LoRA "
+                         "weights but NOT GradScaler's calibrated scale, so every such resume "
+                         "restarts scale-finding from scratch. Confirmed via direct checkpoint diffs "
+                         "that this can spiral: a scale of 65536 is often wrong for an already-"
+                         "partially-trained adapter, triggering a run of overflow-halvings with no "
+                         "successful step in between to grow it back up, until the scale collapses to "
+                         "a degenerate value where every step overflows and gets skipped forever (a "
+                         "real, extended stall this project's NaNGuardCallback zero_patience trigger "
+                         "now catches fast, but doesn't prevent from happening in the first place). "
+                         "Starting much lower needs far fewer halvings to reach a safe operating "
+                         "point, and GradScaler's own growth_interval will grow it back up over time "
+                         "if this turns out to be more conservative than necessary -- harmless for a "
+                         "genuinely fresh run, specifically protective for a Hub-fallback resume.")
     p.add_argument("--detect_anomaly", action="store_true",
                     help="Wrap trainer.train() in torch.autograd.set_detect_anomaly(True). This is "
                          "the actual right tool for this project's still-unresolved IndicTrans2 "
@@ -777,6 +793,17 @@ def main():
         debug_tokenizer=tokenizer,
         **{tok_kwarg: tokenizer},
     )
+
+    if not args.no_fp16 and getattr(getattr(trainer, "accelerator", None), "scaler", None) is not None:
+        # See --fp16_init_scale's help text for why. Rebuilding rather than mutating in place:
+        # GradScaler doesn't expose a public setter for _scale, and swapping the whole object
+        # (same growth_factor/backoff_factor/growth_interval defaults PyTorch itself uses,
+        # only init_scale changed) is simpler than reaching into a private attribute.
+        import torch
+        old_scale = trainer.accelerator.scaler.get_scale()
+        trainer.accelerator.scaler = torch.cuda.amp.GradScaler(init_scale=args.fp16_init_scale)
+        print(f"lowered GradScaler's initial loss scale from PyTorch's default-derived {old_scale} "
+              f"to {args.fp16_init_scale} — see --fp16_init_scale's help text for why.")
 
     if args.detect_anomaly:
         import torch
