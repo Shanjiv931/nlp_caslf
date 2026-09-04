@@ -153,6 +153,45 @@ def tag_indictrans2_text(texts, src_lang, tgt_lang):
 _SPECIAL_TOKEN_LITERALS = ["<unk>", "<pad>", "<s>", "</s>"]
 
 
+_MOJIBAKE_RANGE_LO = chr(0x80)
+_MOJIBAKE_RANGE_HI = chr(0xFF)
+
+
+def mojibake_fraction(text):
+    """Fraction of characters in `text` that fall in the Latin-1 Supplement
+    Unicode block (U+0080-U+00FF).
+
+    Found directly responsible (2026-09-04) for a genuine, precision-
+    independent training crash: a row's "Bengali" text field was actually
+    UTF-8 bytes that had been decoded as Latin-1/cp1252 and re-encoded --
+    classic double-encoding mojibake (e.g. Bengali 'আমি' becomes
+    'à¦†à¦®à¦¿'). Confirmed via torch.autograd.set_detect_anomaly that training
+    directly on this exact row produces NaN in cross-entropy's backward --
+    under fp16 GradScaler silently skipped the corrupted step (masking the
+    problem, which is why this went undetected for so long), but under fp32
+    (no skip mechanism) the same batch corrupted the model outright on the
+    very first step.
+
+    This is a much more targeted signal than "how much of the text is in
+    the Bengali Unicode block" (which was tried first and rejected): real
+    Bengali social-media text legitimately includes large amounts of
+    Latin-script content -- English loanwords, and especially "Banglish"
+    (Bengali words spelled out phonetically in plain ASCII, very common
+    informal usage) -- and a script-fraction filter would have discarded
+    thousands of those legitimate rows. Mojibake specifically lands in the
+    Latin-1 SUPPLEMENT block (accented/high-byte Latin-1 characters like
+    the 'Ã', '¦', '¯' family), which plain ASCII Banglish never touches at
+    all -- directly checking train.jsonl found this split is sharply
+    bimodal: 99.8% of rows sit at exactly 0%, and everything above ~20% is
+    unambiguous garbage (spot-checked directly, zero false positives found),
+    with no meaningful middle ground to tune a threshold against.
+    """
+    if not text:
+        return 0.0
+    n = sum(1 for c in text if _MOJIBAKE_RANGE_LO <= c <= _MOJIBAKE_RANGE_HI)
+    return n / len(text)
+
+
 def sanitize_text(text):
     """Strip literal occurrences of common tokenizer special-token strings
     from raw text. Some source datasets embed these as data-collection

@@ -73,6 +73,7 @@ from mt_compat import (
     ensure_tie_weights_compat,
     ensure_transformers_onnx_shim,
     get_indic_processor,
+    mojibake_fraction,
     sanitize_text,
     tag_indictrans2_text,
 )
@@ -120,6 +121,7 @@ PROCESSED = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
 
 MAX_ROW_CHARS = 500  # see load_direction_dataset's docstring for why
+MAX_MOJIBAKE_FRACTION = 0.15  # see mojibake_fraction's docstring for why
 
 
 def load_direction_dataset(path, direction, max_rows=None):
@@ -153,6 +155,20 @@ def load_direction_dataset(path, direction, max_rows=None):
     above the 280-char platform limit) specifically to avoid discarding any
     genuine longer-form tweet content: this removes 649/572,703 rows
     (0.11%), not a meaningful data-loss concern at this scale.
+
+    Also drops any row whose "text" field (always Bengali, regardless of
+    --direction -- see the src/tgt assignment below) has a mojibake_fraction
+    above MAX_MOJIBAKE_FRACTION -- found (2026-09-04) via
+    torch.autograd.set_detect_anomaly to be a genuine, precision-independent
+    cause of NaN: a row whose Bengali text was actually double-encoded UTF-8
+    garbage produced a real NaN in cross-entropy's backward when trained on
+    directly, under BOTH fp16 and fp32 (fp16's GradScaler happened to skip
+    the corrupted step silently, which is why this went undetected through
+    several earlier fp16 runs; fp32 has no such skip mechanism and the same
+    batch corrupted the model outright on its very first step). See
+    mojibake_fraction's own docstring for why this check (not a general
+    Bengali-script-fraction check, which would have wrongly discarded real
+    Banglish/loanword-heavy tweets) is the right, narrowly-targeted filter.
     """
     rows = []
     with open(path, encoding="utf-8") as f:
@@ -163,6 +179,8 @@ def load_direction_dataset(path, direction, max_rows=None):
             if not row.get("text") or not row.get("parallel_text"):
                 continue
             if len(row["text"]) > MAX_ROW_CHARS or len(row["parallel_text"]) > MAX_ROW_CHARS:
+                continue
+            if mojibake_fraction(row["text"]) > MAX_MOJIBAKE_FRACTION:
                 continue
             if direction == "bn2en":
                 src, tgt = row["text"], row["parallel_text"]  # text is bn, parallel_text is en
