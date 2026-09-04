@@ -643,6 +643,21 @@ def main():
         eval_steps=args.save_steps,
         seed=args.seed,
         data_seed=args.seed,
+        # 2026-08-30: every micro-batch that torch.autograd.set_detect_anomaly
+        # pinned as the exact NaN trigger (twice now -- once with SDPA, once
+        # with attn_implementation="eager", ruling out the attention kernel
+        # as the variable) has the same shape: real target content as short
+        # as 5-12 tokens padded out to a batch max of 16-36 -- up to 83%
+        # padding in a single batch. Plain random shuffling can put a long
+        # and several very-short examples in the same micro-batch purely by
+        # chance. group_by_length uses HF's LengthGroupedSampler to batch
+        # similarly-LENGTH examples together instead -- standard practice in
+        # every serious NMT pipeline (fairseq, OpenNMT, etc. all call this
+        # "bucketing") for the ordinary reason of reducing wasted compute on
+        # padding, but it also directly removes the extreme-padding-ratio
+        # batches this specific NaN has been traced to twice. Doesn't change
+        # what data is trained on, only what gets batched with what.
+        group_by_length=True,
         logging_steps=50,
         predict_with_generate=True,
         push_to_hub=bool(args.push_to_hub),
