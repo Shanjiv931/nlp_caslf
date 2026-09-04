@@ -229,30 +229,53 @@ class NaNGuardCallback(TrainerCallback):
     that state, since a NaN-poisoned LoRA weight never recovers on its own
     (the whole point of find_nan_lora_params existing at all).
 
-    Trigger condition: `patience` CONSECUTIVE logging_steps intervals where
-    grad_norm is NaN/Inf. grad_norm alone (not loss) is the signal, because
-    loss has shown up as exactly 0.0 in this project's own logs during
-    NaN-weight episodes (a known separate PyTorch quirk: cross-entropy with
-    every label in a window masked to ignore_index can legitimately return
-    a clean 0.0, not NaN) -- grad_norm has no equivalent legitimate-zero
-    case this project has seen, and requiring several consecutive bad
-    windows (not just one) avoids aborting on a single noisy step early in
-    training, before warmup has fully ramped, when an occasional skipped
-    GradScaler step is normal and recoverable.
+    Trigger condition 1 (NaN/Inf): `patience` CONSECUTIVE logging_steps
+    intervals where grad_norm is NaN/Inf. grad_norm alone (not loss) is the
+    signal, because loss has shown up as exactly 0.0 in this project's own
+    logs during NaN-weight episodes (a known separate PyTorch quirk:
+    cross-entropy with every label in a window masked to ignore_index can
+    legitimately return a clean 0.0, not NaN) -- grad_norm has no equivalent
+    legitimate-zero case this project has seen, and requiring several
+    consecutive bad windows (not just one) avoids aborting on a single
+    noisy step early in training, before warmup has fully ramped, when an
+    occasional skipped GradScaler step is normal and recoverable.
+
+    Trigger condition 2 (stalled, added 2026-09-04): `zero_patience`
+    CONSECUTIVE logging_steps intervals where grad_norm is exactly 0 (not
+    NaN). A single 0 is a normal, harmless GradScaler-skipped step (see
+    above) and does NOT count toward this -- but a SUSTAINED run of them is
+    a different, real failure mode this project hit for real: a Hub-fallback
+    resume restores weights but not GradScaler's internal loss-scale state,
+    so it restarts calibration from scratch: if overflow recurs a few times
+    in a row right after that, the scale can spiral down (halved on every
+    overflow, never doubled back up without a successful step) to a
+    degenerate value where literally every subsequent step overflows and
+    gets skipped, forever. That state is invisible in the logs alone --
+    loss looks fine (whatever it last was), grad_norm just reads 0 forever,
+    and the checkpoint stays "clean" (no NaN ever lands, because no update
+    ever lands) -- it looks identical to healthy-but-quiet training unless
+    you directly diff two checkpoints' weights, which is how this was
+    actually caught: 574/576 tensors byte-identical between steps 500 and
+    1000, zero movement, after 16 consecutive logged windows of grad_norm:
+    0. That run silently burned real GPU-hour quota doing nothing for the
+    time it went undetected. zero_patience is deliberately much larger than
+    `patience` (occasional real zeros are expected and fine) but this still
+    catches a stall within a few hundred steps instead of hours.
     """
-    def __init__(self, patience=3):
+    def __init__(self, patience=3, zero_patience=8):
         self.patience = patience
+        self.zero_patience = zero_patience
         self._consecutive_bad = 0
+        self._consecutive_zero = 0
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs or "grad_norm" not in logs:
             return control
         grad_norm = logs["grad_norm"]
-        is_bad = grad_norm is None or grad_norm != grad_norm or grad_norm in (float("inf"), float("-inf"))
-        if is_bad:
-            self._consecutive_bad += 1
-        else:
-            self._consecutive_bad = 0
+        is_nan_inf = grad_norm is None or grad_norm != grad_norm or grad_norm in (float("inf"), float("-inf"))
+        is_zero = (not is_nan_inf) and grad_norm == 0.0
+        self._consecutive_bad = self._consecutive_bad + 1 if is_nan_inf else 0
+        self._consecutive_zero = self._consecutive_zero + 1 if is_zero else 0
         if self._consecutive_bad >= self.patience:
             print(f"NaNGuardCallback: grad_norm has been NaN/Inf for {self._consecutive_bad} "
                   f"consecutive logged steps (step {state.global_step}) — this pattern has never "
@@ -262,6 +285,19 @@ class NaNGuardCallback(TrainerCallback):
                   f"and should NOT be trusted — resume with --resume to fall back to the last known "
                   f"clean local/Hub checkpoint (find_nan_lora_params will reject this one), or drop "
                   f"--resume for a fresh LoRA init.")
+            control.should_training_stop = True
+        elif self._consecutive_zero >= self.zero_patience:
+            print(f"NaNGuardCallback: grad_norm has been exactly 0 for {self._consecutive_zero} "
+                  f"consecutive logged steps (step {state.global_step}) — unlike an occasional 0 "
+                  f"(a normal, harmless skipped GradScaler step), this many in a row means training "
+                  f"has almost certainly stalled: GradScaler's loss scale has likely collapsed to a "
+                  f"degenerate value after repeated overflow (common after a Hub-fallback resume, "
+                  f"which restores weights but not GradScaler's scale state) where every step "
+                  f"overflows and gets skipped -- the checkpoint stays clean but stops learning "
+                  f"entirely, silently, with nothing else in the log to show it. Stopping training "
+                  f"now rather than continuing to burn GPU-hour quota with zero progress. If this "
+                  f"fires, --no_fp16 (fp32 needs no loss scaling, so this failure mode cannot occur) "
+                  f"is the recommended retry, not --resume onto this same stalled state.")
             control.should_training_stop = True
         return control
 
