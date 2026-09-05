@@ -35,6 +35,13 @@ _QE_MODEL = None
 _QE_LOAD_ATTEMPTED = False
 _QE_LOAD_ERROR = None
 
+# Set to False once unbabel-comet is upgraded to a version compatible with
+# the installed transformers (see the note in load_qe_model below) --
+# confirmed 2026-09-05 that loading any CometKiwi checkpoint is currently
+# pure wasted cost: it will download successfully but crash on the very
+# first .predict() call, so there is no point ever attempting the load.
+_QE_KNOWN_INCOMPATIBLE = True
+
 
 def load_qe_model(checkpoints=None):
     """Loads and caches a reference-free COMET-QE model. Returns None (and
@@ -46,6 +53,33 @@ def load_qe_model(checkpoints=None):
     if _QE_LOAD_ATTEMPTED:
         return _QE_MODEL
     _QE_LOAD_ATTEMPTED = True
+
+    if _QE_KNOWN_INCOMPATIBLE:
+        # comet/encoders/xlmr.py:95's `last_hidden_states, _, all_layers =
+        # self.model(...)` expects a 3-tuple from the underlying HF model's
+        # forward() call -- a pre-~4.30 transformers calling convention.
+        # transformers==5.0.0 (what's actually installed) returns a 2-tuple
+        # there, causing `ValueError: not enough values to unpack (expected
+        # 3, got 2)` on every comet/CometKiwi .predict() call regardless of
+        # checkpoint. Confirmed via full traceback on the reference-based
+        # COMET path (compute_comet() in eval/evaluate.py, 2026-09-05) --
+        # the exact same encoder forward() chain is used here, so any
+        # checkpoint loaded here would crash identically on the first
+        # score_candidates_with_qe() call and fall through to
+        # score_candidates_fallback() anyway (see rerank()'s except below).
+        # Skip straight to the fallback instead of paying for a multi-GB
+        # download (wmt23-cometkiwi-da-xl, tried first, is NOT small) that
+        # is guaranteed to end in the same place -- and that can hang
+        # indefinitely with zero visible progress on a flaky connection,
+        # which is exactly what happened during a real full_pipeline run
+        # (observed: 0% GPU, ~1% CPU, completely flat for minutes).
+        _QE_LOAD_ERROR = (
+            "skipped: unbabel-comet==2.2.7 is confirmed incompatible with the "
+            "installed transformers (comet/encoders/xlmr.py:95 3-tuple unpack "
+            "vs. transformers' 2-tuple return) -- loading would only waste a "
+            "multi-GB download before crashing on the first predict() call"
+        )
+        return None
 
     from comet import download_model, load_from_checkpoint
 
