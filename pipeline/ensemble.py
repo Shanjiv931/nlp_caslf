@@ -37,6 +37,7 @@ class EngineContext:
     is_nllb: bool
     src_lang: str
     tgt_lang: str
+    device: str = "cpu"
 
 
 @dataclass
@@ -75,11 +76,29 @@ def load_engine(engine_key, direction, adapter_prefix=mc.DEFAULT_HF_ADAPTER_PREF
 
     mc.ensure_all_compat_shims()
 
+    import torch
     from peft import PeftModel
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     model_name = mc.base_model_name(engine_key, direction)
     adapter_repo = mc.adapter_repo_id(engine_key, direction, adapter_prefix)
+
+    # Bug found 2026-09-05 during the "find all possible errors" audit: this
+    # function never placed the model (or, further down in
+    # generate_candidates_for_engine, its inputs) on the GPU -- from_pretrained
+    # with no device_map/`.to()` call leaves everything on CPU by default.
+    # Every one of today's "hangs" (0% GPU, low/flat CPU%, no crash, no
+    # output for minutes) is consistent with this: beam search + nucleus
+    # sampling for a 1B-parameter model, run three times per example (one
+    # per engine) on CPU alone, is genuinely slow -- not stuck. This was
+    # never a network stall like the CometKiwi/Qwen/LaBSE downloads; it's
+    # the actual translation engines silently never touching the GPU that
+    # Kaggle session-hours are being spent on. use_4bit is never True for
+    # these ensemble engines in this codebase (only llm_postedit.py's
+    # separate 7B LLM uses it), so `.to(device)` below is always safe --
+    # bitsandbytes 4-bit models can't use `.to()` and need `device_map`
+    # instead, which is why this is skipped when use_4bit is set.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     quant_kwargs = {}
     if use_4bit:
@@ -87,6 +106,7 @@ def load_engine(engine_key, direction, adapter_prefix=mc.DEFAULT_HF_ADAPTER_PREF
         quant_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_compute_dtype="bfloat16", bnb_4bit_quant_type="nf4",
         )
+        quant_kwargs["device_map"] = "auto"
 
     # Debug checkpoints added 2026-09-05: a full_pipeline run on Kaggle hung
     # with ~1% CPU / 0% GPU right after indictrans2's base model finished
@@ -103,8 +123,11 @@ def load_engine(engine_key, direction, adapter_prefix=mc.DEFAULT_HF_ADAPTER_PREF
     base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, trust_remote_code=True, **quant_kwargs)
     print(f"[load_engine:{engine_key}] base model loaded; applying adapter ({adapter_repo}) ...", flush=True)
     model = PeftModel.from_pretrained(base_model, adapter_repo)
+    if not use_4bit:
+        print(f"[load_engine:{engine_key}] moving model to {device} ...", flush=True)
+        model = model.to(device)
     model.eval()
-    print(f"[load_engine:{engine_key}] adapter applied.", flush=True)
+    print(f"[load_engine:{engine_key}] adapter applied (device={device}).", flush=True)
 
     is_indictrans2 = engine_key == "indictrans2"
     is_nllb = engine_key == "nllb"
@@ -124,7 +147,7 @@ def load_engine(engine_key, direction, adapter_prefix=mc.DEFAULT_HF_ADAPTER_PREF
     ctx = EngineContext(
         engine_key=engine_key, direction=direction, model=model, tokenizer=tokenizer,
         indic_processor=indic_processor, is_indictrans2=is_indictrans2, is_nllb=is_nllb,
-        src_lang=src_lang, tgt_lang=tgt_lang,
+        src_lang=src_lang, tgt_lang=tgt_lang, device=device,
     )
     _MODEL_CACHE[cache_key] = ctx
     return ctx
@@ -167,6 +190,11 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
 
     processed_source = preprocess_source(ctx, source_text)
     inputs = ctx.tokenizer(processed_source, return_tensors="pt", truncation=True, max_length=128)
+    # Companion fix to load_engine's model placement above: a model on GPU
+    # with CPU-resident inputs raises "Expected all tensors to be on the
+    # same device" the moment .generate() is called, so this has to move in
+    # lockstep with that change.
+    inputs = {k: v.to(ctx.device) for k, v in inputs.items()}
 
     gen_kwargs_common = {}
     if ctx.is_nllb:
