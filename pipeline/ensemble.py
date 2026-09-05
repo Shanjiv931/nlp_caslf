@@ -269,6 +269,18 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
         except Exception:
             pass
 
+    # Confirmed for real 2026-09-06 via eval/diagnose_engines.py: without any
+    # repetition control, generation for both indictrans2 and banglat5
+    # collapses into long degenerate loops ("Mahindra Mahindra Mahindra...",
+    # "here. here. here...") -- a well-known beam-search failure mode absent
+    # a standard repetition guard, not something a better/retrained adapter
+    # would fix on its own. no_repeat_ngram_size and repetition_penalty are
+    # the field's standard mitigation (used by fairseq, HF's own generation
+    # examples, etc.) and cost nothing extra in model/GPU time -- applied to
+    # both beam search and nucleus sampling below.
+    gen_kwargs_common["no_repeat_ngram_size"] = 3
+    gen_kwargs_common["repetition_penalty"] = 1.3
+
     raw_candidates = []
     with torch.no_grad():
         beam_out = ctx.model.generate(
