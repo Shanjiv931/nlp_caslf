@@ -18,10 +18,60 @@ transforms, deduplication) are unit-tested locally, using mock objects that
 don't require torch. Real end-to-end verification needs Kaggle/Colab or
 another working-torch environment, same as Phase 6.
 """
+import signal
 from dataclasses import dataclass
 from typing import List, Optional
 
 import mt_compat as mc
+
+# Real hang found and confirmed for real 2026-09-05: with the GPU-placement
+# and per-step debug checkpoints already in place, a full_pipeline run's
+# indictrans2 beam candidate 0 postprocessed instantly, but candidate 1's
+# IndicProcessor.postprocess_batch() call (IndicTransToolkit, third-party)
+# hung indefinitely on that specific piece of generated text -- ruling out
+# "first call is slow" (candidate 0 already proved the IndicProcessor is
+# warm and fast) and pointing at a genuine pathological-input bug in the
+# library itself (most likely quadratic/catastrophic-backtracking regex
+# behavior on degenerate output from an early or undertrained decode, e.g.
+# repeated tokens). This is pure CPU computation, not network I/O, so
+# mt_compat.py's socket.setdefaulttimeout(120) cannot catch it -- a
+# SIGALRM-based wall-clock timeout is the only mechanism that can, and one
+# specific enough to wrap only this call rather than the whole pipeline.
+_POSTPROCESS_TIMEOUT_SECONDS = 30
+
+
+class _PostprocessTimeout(Exception):
+    pass
+
+
+def _postprocess_with_timeout(ctx, decoded_text, label, timeout_seconds=_POSTPROCESS_TIMEOUT_SECONDS):
+    """Runs postprocess_output() under a hard wall-clock timeout, falling
+    back to the plain decoded/stripped text (never crashing or hanging the
+    whole run over one degenerate candidate) if it doesn't return in time.
+    SIGALRM only exists on POSIX -- the real execution environment for this
+    pipeline is always a Linux Kaggle GPU session, never this Windows dev
+    machine, so on Windows (where the unit tests run, against fast fake
+    IndicProcessor objects) this just calls postprocess_output() directly
+    with no timeout at all."""
+    if not hasattr(signal, "SIGALRM"):
+        return postprocess_output(ctx, decoded_text)
+
+    def _handler(signum, frame):
+        raise _PostprocessTimeout()
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout_seconds)
+    try:
+        return postprocess_output(ctx, decoded_text)
+    except _PostprocessTimeout:
+        print(f"WARNING: [generate:{ctx.engine_key}] postprocessing {label} exceeded "
+              f"{timeout_seconds}s (likely a pathological-input bug in IndicProcessor / "
+              f"IndicTransToolkit, not a network or GPU issue) -- falling back to the "
+              f"plain decoded text for this candidate, un-postprocessed, and continuing.")
+        return decoded_text.strip()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 ALL_ENGINES = ["indictrans2", "nllb", "banglat5"]
 
@@ -233,23 +283,19 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
         )
         print(f"[generate:{ctx.engine_key}] beam search done.", flush=True)
         beam_scores = beam_out.sequences_scores.tolist() if beam_out.sequences_scores is not None else [None] * len(beam_out.sequences)
-        # Debug checkpoints added 2026-09-05: after beam search itself was
-        # confirmed done (previous checkpoint), a run went silent for 6+
-        # minutes with zero further output and zero movement on any Kaggle
-        # metric (Disk/CPU/RAM/GPU Memory all identical across checks) --
-        # the only untraced code between "beam search done" and the next
-        # planned checkpoint ("starting nucleus sampling") is this decode
-        # loop, specifically postprocess_output()'s call into
-        # IndicTransToolkit's IndicProcessor.postprocess_batch(), which does
-        # non-trivial CPU work (denormalization/desandhi) unrelated to the
-        # GPU or network -- so neither the earlier socket timeout nor the
-        # GPU fix could catch a stall here. Splitting decode vs postprocess
-        # into separate prints to find out which one it actually is.
+        # Confirmed for real 2026-09-05: beam candidate 0 postprocessed
+        # instantly, but candidate 1's postprocess_output() call hung
+        # indefinitely -- a genuine pathological-input bug in
+        # IndicTransToolkit's IndicProcessor.postprocess_batch() (CPU-only,
+        # not caught by mt_compat.py's socket timeout or the GPU-placement
+        # fix), not a "first call is slow" issue. _postprocess_with_timeout
+        # bounds this call and degrades to the plain decoded text on
+        # timeout rather than losing the whole run to one bad candidate.
         for i, (seq, score) in enumerate(zip(beam_out.sequences, beam_scores)):
             print(f"[generate:{ctx.engine_key}] decoding beam candidate {i} ...", flush=True)
             decoded = ctx.tokenizer.decode(seq, skip_special_tokens=True)
             print(f"[generate:{ctx.engine_key}] beam candidate {i} decoded; postprocessing ...", flush=True)
-            text = postprocess_output(ctx, decoded)
+            text = _postprocess_with_timeout(ctx, decoded, label=f"beam candidate {i}")
             print(f"[generate:{ctx.engine_key}] beam candidate {i} postprocessed.", flush=True)
             raw_candidates.append(Candidate(text=text, engine=ctx.engine_key, method="beam",
                                              source_text=source_text, direction=ctx.direction,
@@ -283,8 +329,9 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
                     **gen_kwargs_common,
                 )
                 print(f"[generate:{ctx.engine_key}] nucleus sampling done.", flush=True)
-                for seq in sample_out:
-                    text = postprocess_output(ctx, ctx.tokenizer.decode(seq, skip_special_tokens=True))
+                for i, seq in enumerate(sample_out):
+                    decoded = ctx.tokenizer.decode(seq, skip_special_tokens=True)
+                    text = _postprocess_with_timeout(ctx, decoded, label=f"sample candidate {i}")
                     raw_candidates.append(Candidate(text=text, engine=ctx.engine_key, method="sample",
                                                      source_text=source_text, direction=ctx.direction))
             except Exception as e:
