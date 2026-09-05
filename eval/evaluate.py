@@ -34,6 +34,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "pipeline"))
 
 import sacrebleu
+from tqdm import tqdm
 
 from platform_fidelity import score_dataset
 
@@ -201,7 +202,14 @@ TRANSLATE_FNS = {
 
 
 def run_mode(mode_name, pairs, direction, translate_fn):
-    hypotheses = [translate_fn(p["source"], direction) for p in pairs]
+    # No progress output here used to mean total silence for the entire
+    # per-example loop (200 examples, no print/tqdm at all) -- looked
+    # indistinguishable from a hang, especially for pretrained_baseline/
+    # single_model_baseline's CPU-only generation. Confirmed for real
+    # 2026-09-06: a run sitting quietly for 5+ minutes after model download
+    # finished was actually just working through this exact loop.
+    hypotheses = [translate_fn(p["source"], direction)
+                  for p in tqdm(pairs, desc=f"{mode_name} ({direction})")]
     references = [p["reference"] for p in pairs]
     sources = [p["source"] for p in pairs]
 
