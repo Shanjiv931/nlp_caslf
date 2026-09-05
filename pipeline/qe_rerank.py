@@ -122,13 +122,31 @@ def rerank(source_text: str, candidates: List[Candidate]) -> dict:
         return {"winner": None, "method": "none", "scored": []}
 
     qe_model = load_qe_model()
+    scored = None
     if qe_model is not None:
-        scored = score_candidates_with_qe(source_text, candidates, qe_model=qe_model)
-        method = "comet_qe"
-    else:
-        print(f"WARNING: no QE model available ({_QE_LOAD_ERROR}) — falling back to "
-              f"length-normalized beam log-probability. Nucleus-sampled candidates have "
-              f"no comparable score and are ranked below any scored beam candidate.")
+        try:
+            scored = score_candidates_with_qe(source_text, candidates, qe_model=qe_model)
+            method = "comet_qe"
+        except Exception as e:
+            # Model LOADED fine but .predict() itself threw -- a distinct
+            # failure mode from qe_model being None, and one the original
+            # code didn't guard against. Confirmed for real 2026-09-06:
+            # a "ValueError: not enough values to unpack (expected 3, got
+            # 2)" in the reference-based COMET call (same unbabel-comet
+            # package, likely a version-compatibility crack against the
+            # much newer pytorch-lightning/torchmetrics actually
+            # installed) -- without this except, the identical error here
+            # would crash the entire full_pipeline run instead of falling
+            # back, directly contradicting this module's own stated design
+            # ("never crash, never silently ship unranked output").
+            print(f"WARNING: QE model loaded but predict() failed ({type(e).__name__}: {e}) — "
+                  f"falling back to length-normalized beam log-probability for this example.")
+
+    if scored is None:
+        if qe_model is None:
+            print(f"WARNING: no QE model available ({_QE_LOAD_ERROR}) — falling back to "
+                  f"length-normalized beam log-probability. Nucleus-sampled candidates have "
+                  f"no comparable score and are ranked below any scored beam candidate.")
         scored = score_candidates_fallback(candidates)
         method = "logprob_fallback"
 

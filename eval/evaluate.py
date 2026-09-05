@@ -217,8 +217,22 @@ def run_mode(mode_name, pairs, direction, translate_fn):
     try:
         metrics["comet"] = compute_comet(sources, hypotheses, references)
     except Exception as e:
+        # Full traceback, not just str(e) -- confirmed for real 2026-09-06:
+        # a "ValueError: not enough values to unpack (expected 3, got 2)"
+        # persisted even after pinning CUDA_VISIBLE_DEVICES=0 (ruling out
+        # the dual-GPU theory), meaning it's a real version-compatibility
+        # crack between unbabel-comet==2.2.7 (pinned to torchmetrics<0.11,
+        # written for pytorch-lightning ~1.6-era APIs) and the much newer
+        # stack actually installed (pytorch-lightning auto-upgrades
+        # checkpoints to v2.6.5, torchmetrics 1.9.0, transformers 5.0.0).
+        # str(e) alone doesn't say which library's internals the unpack
+        # happens in -- the full traceback does, and is needed to fix this
+        # properly instead of guessing.
+        import traceback
         metrics["comet"] = None
         metrics["comet_error"] = f"{type(e).__name__}: {e}"
+        metrics["comet_traceback"] = traceback.format_exc()
+        print(f"  [comet failed] {metrics['comet_error']}\n{metrics['comet_traceback']}")
 
     pfs_input = [{"source_text": s, "translated_text": h} for s, h in zip(sources, hypotheses)]
     pfs = score_dataset(pfs_input)
