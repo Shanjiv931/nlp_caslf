@@ -11,8 +11,36 @@ train_colab.ipynb's `ENGINES` dict exactly — if that dict changes, this
 module's ENGINE_MODEL_NAMES must be updated to match, or training and
 inference will silently use different base checkpoints.
 """
+import socket
 import sys
 import types
+
+# ---------------------------------------------------------------------------
+# Global network timeout — applied at this module's own import time (not
+# deferred into a function) since virtually every pipeline module
+# (ensemble.py, quality_pipeline.py, llm_postedit.py, qe_rerank.py,
+# roundtrip_verify.py) either imports this module directly or is imported
+# alongside something that does, making this the single earliest common
+# point to guarantee it's set before any model-loading code runs.
+#
+# Confirmed for real, 2026-09-05, three separate times in one Kaggle
+# session: a huggingface_hub download (CometKiwi's wmt23-cometkiwi-da-xl
+# checkpoint, then separately Qwen2.5-7B-Instruct for llm_postedit.py) sat
+# completely silent -- 0% GPU, ~1% CPU, zero throughput -- for 4+ hours
+# with no exception ever raised, because neither huggingface_hub's download
+# stream nor sentence-transformers' model download sets an explicit
+# per-request timeout, so a stalled TCP connection just blocks forever.
+# socket.setdefaulttimeout() sets the default for any socket that doesn't
+# specify its own timeout, which covers this exact gap; 120s tolerates a
+# slow-but-actually-progressing download (the timeout resets on every
+# successful recv, so a multi-hour download that keeps trickling bytes
+# never trips it) while still turning a genuine full stall into a
+# TimeoutError within 2 minutes instead of hanging indefinitely -- which
+# matters even with a per-example try/except elsewhere (see
+# eval/evaluate.py's run_mode()), since a try/except can only catch an
+# exception that actually gets raised, not a call that never returns at
+# all.
+socket.setdefaulttimeout(120)
 
 # ---------------------------------------------------------------------------
 # Engine / adapter naming — single source of truth for which HF Hub repo

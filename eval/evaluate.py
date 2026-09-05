@@ -208,12 +208,39 @@ def run_mode(mode_name, pairs, direction, translate_fn):
     # single_model_baseline's CPU-only generation. Confirmed for real
     # 2026-09-06: a run sitting quietly for 5+ minutes after model download
     # finished was actually just working through this exact loop.
-    hypotheses = [translate_fn(p["source"], direction)
-                  for p in tqdm(pairs, desc=f"{mode_name} ({direction})")]
+    #
+    # try/except added 2026-09-05: this list comprehension used to call
+    # translate_fn() completely unguarded -- a single example raising for
+    # ANY reason (a transient network blip, an edge-case input, anything
+    # inside full_pipeline's ensemble+QE+LLM-postedit+round-trip chain)
+    # crashed the entire multi-hour run and wrote nothing to disk, discarding
+    # every one of the other ~199 already-computed examples along with it.
+    # Paired with mt_compat.py's new socket.setdefaulttimeout(120): a stalled
+    # network call now actually raises (instead of hanging forever) and that
+    # raise is now caught here instead of taking down the whole run. A failed
+    # example gets an empty-string hypothesis (scores ~0 against its
+    # reference in corpus-level BLEU/chrF++/TER -- an honest, visible
+    # penalty, not silently dropped or excluded) and a printed warning naming
+    # which example and why, never a swallowed failure.
+    hypotheses = []
+    n_failed = 0
+    for p in tqdm(pairs, desc=f"{mode_name} ({direction})"):
+        try:
+            hypotheses.append(translate_fn(p["source"], direction))
+        except Exception as e:
+            n_failed += 1
+            hypotheses.append("")
+            print(f"WARNING: {mode_name} ({direction}) failed on example "
+                  f"{len(hypotheses)}/{len(pairs)} ({type(e).__name__}: {e}) "
+                  f"-- scored as an empty hypothesis, continuing")
+    if n_failed:
+        print(f"{mode_name} ({direction}): {n_failed}/{len(pairs)} examples failed "
+              f"and were scored as empty hypotheses -- see WARNING lines above")
     references = [p["reference"] for p in pairs]
     sources = [p["source"] for p in pairs]
 
     metrics = compute_metrics(hypotheses, references)
+    metrics["n_failed"] = n_failed
     try:
         metrics["comet"] = compute_comet(sources, hypotheses, references)
     except Exception as e:
