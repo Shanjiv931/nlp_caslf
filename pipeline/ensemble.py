@@ -88,16 +88,33 @@ def load_engine(engine_key, direction, adapter_prefix=mc.DEFAULT_HF_ADAPTER_PREF
             load_in_4bit=True, bnb_4bit_compute_dtype="bfloat16", bnb_4bit_quant_type="nf4",
         )
 
+    # Debug checkpoints added 2026-09-05: a full_pipeline run on Kaggle hung
+    # with ~1% CPU / 0% GPU right after indictrans2's base model finished
+    # loading, even with HF_HUB_OFFLINE=1 set (which only silences
+    # huggingface_hub -- it does nothing for a stall in a *different*
+    # library's own network/resource-loading code, e.g. IndicTransToolkit's
+    # IndicProcessor). Prints below pin down exactly which of these four
+    # steps is actually the one that never returns, instead of guessing
+    # again. print(..., flush=True) since this runs inside a piped `!python`
+    # subprocess where stdout can be block-buffered.
+    print(f"[load_engine:{engine_key}] loading tokenizer ({model_name}) ...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    print(f"[load_engine:{engine_key}] tokenizer loaded; loading base model ...", flush=True)
     base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, trust_remote_code=True, **quant_kwargs)
+    print(f"[load_engine:{engine_key}] base model loaded; applying adapter ({adapter_repo}) ...", flush=True)
     model = PeftModel.from_pretrained(base_model, adapter_repo)
     model.eval()
+    print(f"[load_engine:{engine_key}] adapter applied.", flush=True)
 
     is_indictrans2 = engine_key == "indictrans2"
     is_nllb = engine_key == "nllb"
     src_lang, tgt_lang = mc.direction_lang_codes(direction)
 
+    if is_indictrans2:
+        print(f"[load_engine:{engine_key}] constructing IndicProcessor ...", flush=True)
     indic_processor = mc.get_indic_processor(inference=True) if is_indictrans2 else None
+    if is_indictrans2:
+        print(f"[load_engine:{engine_key}] IndicProcessor ready.", flush=True)
     if is_nllb:
         if hasattr(tokenizer, "src_lang"):
             tokenizer.src_lang = src_lang
