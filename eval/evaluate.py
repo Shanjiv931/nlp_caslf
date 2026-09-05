@@ -201,6 +201,23 @@ TRANSLATE_FNS = {
 }
 
 
+# Confirmed for real 2026-09-05: a "CUDA error: device-side assert
+# triggered" on one example (banglat5, ~111/200 into a full_pipeline run)
+# poisoned the CUDA context for the rest of the process -- the very next
+# example's indictrans2 call failed with the identical error, despite
+# indictrans2 having generated real candidates successfully for all 111
+# prior examples. This is a well-known CUDA behavior: once a device-side
+# assert fires, every subsequent CUDA call in that process is guaranteed to
+# fail identically until the process is restarted -- there is no in-process
+# recovery. Continuing the per-example loop past this point wastes GPU
+# session-hours reloading full models from disk for every remaining
+# example, each of which fails identically and contributes nothing but an
+# empty hypothesis. Recognizing this specific, unambiguous marker string
+# lets run_mode() stop immediately instead of limping through the rest of
+# the dataset.
+_UNRECOVERABLE_CUDA_MARKER = "device-side assert triggered"
+
+
 def run_mode(mode_name, pairs, direction, translate_fn):
     # No progress output here used to mean total silence for the entire
     # per-example loop (200 examples, no print/tqdm at all) -- looked
@@ -224,6 +241,7 @@ def run_mode(mode_name, pairs, direction, translate_fn):
     # which example and why, never a swallowed failure.
     hypotheses = []
     n_failed = 0
+    aborted_early = False
     for p in tqdm(pairs, desc=f"{mode_name} ({direction})"):
         try:
             hypotheses.append(translate_fn(p["source"], direction))
@@ -233,6 +251,22 @@ def run_mode(mode_name, pairs, direction, translate_fn):
             print(f"WARNING: {mode_name} ({direction}) failed on example "
                   f"{len(hypotheses)}/{len(pairs)} ({type(e).__name__}: {e}) "
                   f"-- scored as an empty hypothesis, continuing")
+            if _UNRECOVERABLE_CUDA_MARKER in str(e):
+                remaining = len(pairs) - len(hypotheses)
+                print(f"FATAL: {mode_name} ({direction}) hit an unrecoverable CUDA error "
+                      f"(\"{_UNRECOVERABLE_CUDA_MARKER}\") -- the CUDA context is now "
+                      f"poisoned for the rest of this process and every remaining example "
+                      f"would fail identically while still burning GPU session-hours "
+                      f"reloading models from disk. Stopping now instead of continuing "
+                      f"through the remaining {remaining}/{len(pairs)} examples: restart "
+                      f"the Python process (a fresh `!python` invocation) to recover CUDA, "
+                      f"then re-run. Padding the remaining examples as empty hypotheses so "
+                      f"results still write to disk with the {len(pairs) - remaining} "
+                      f"examples completed before this point.")
+                hypotheses.extend([""] * remaining)
+                n_failed += remaining
+                aborted_early = True
+                break
     if n_failed:
         print(f"{mode_name} ({direction}): {n_failed}/{len(pairs)} examples failed "
               f"and were scored as empty hypotheses -- see WARNING lines above")
@@ -241,6 +275,7 @@ def run_mode(mode_name, pairs, direction, translate_fn):
 
     metrics = compute_metrics(hypotheses, references)
     metrics["n_failed"] = n_failed
+    metrics["aborted_early"] = aborted_early
     try:
         metrics["comet"] = compute_comet(sources, hypotheses, references)
     except Exception as e:
