@@ -133,6 +133,22 @@ def compute_metrics(hypotheses, references):
     return {"bleu": bleu.score, "chrf++": chrf_pp.score, "ter": ter.score}
 
 
+def _comet_gpu_count():
+    """1 if a CUDA GPU is available, else 0. `model.predict(..., gpus=N)`
+    was hardcoded to `gpus=0` here (and in qe_rerank.py) unconditionally --
+    real bug, not a deliberate CPU-only choice: it silently ran COMET on
+    CPU even on a GPU-equipped Kaggle session, and was a real driver of an
+    8+ hour eval run (2026-09-05) that should have taken a fraction of
+    that. `qe_rerank.py`'s CometKiwi call in particular runs once per test
+    example inside full_pipeline mode, so this one flag has an outsized
+    effect on total runtime."""
+    try:
+        import torch
+        return 1 if torch.cuda.is_available() else 0
+    except ImportError:
+        return 0
+
+
 def compute_comet(sources, hypotheses, references, checkpoint="Unbabel/wmt22-comet-da"):
     """Reference-based COMET (distinct from qe_rerank.py's reference-free
     CometKiwi) — needs the gold reference, appropriate for evaluation where
@@ -141,7 +157,7 @@ def compute_comet(sources, hypotheses, references, checkpoint="Unbabel/wmt22-com
 
     model = load_from_checkpoint(download_model(checkpoint))
     data = [{"src": s, "mt": h, "ref": r} for s, h, r in zip(sources, hypotheses, references)]
-    output = model.predict(data, batch_size=8, gpus=0)
+    output = model.predict(data, batch_size=8, gpus=_comet_gpu_count())
     return output.system_score if hasattr(output, "system_score") else sum(output["scores"]) / len(output["scores"])
 
 
@@ -181,13 +197,26 @@ def main():
                          "override for a full test-set run once time/compute allows.")
     p.add_argument("--baseline_engine", default="nllb")
     p.add_argument("--output_json", default=None)
+    p.add_argument("--modes", default=",".join(TRANSLATE_FNS.keys()),
+                    help="Comma-separated subset of modes to run: "
+                         f"{list(TRANSLATE_FNS.keys())}. `full_pipeline` always evaluates "
+                         "all 3 ensemble engines regardless of --baseline_engine, so its result "
+                         "is identical across a per-engine loop -- run it once per direction, "
+                         "not once per engine, to avoid tripling the cost of the most expensive "
+                         "mode (3 MT engines + CometKiwi reranking + a 7B LLM post-edit + "
+                         "round-trip verification, per example) for no new information.")
     args = p.parse_args()
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    unknown = [m for m in modes if m not in TRANSLATE_FNS]
+    if unknown:
+        p.error(f"unknown mode(s) {unknown}, choose from {list(TRANSLATE_FNS.keys())}")
 
     pairs = load_test_pairs(args.test_file, args.direction, args.max_examples)
     print(f"loaded {len(pairs)} test pairs for direction={args.direction}")
 
     results = {}
-    for mode_name, translate_fn in TRANSLATE_FNS.items():
+    for mode_name in modes:
+        translate_fn = TRANSLATE_FNS[mode_name]
         print(f"running mode: {mode_name} ...")
         if mode_name in ("single_model_baseline", "pretrained_baseline"):
             fn = lambda src, direction, _f=translate_fn: _f(src, direction, engine_key=args.baseline_engine)
@@ -202,13 +231,16 @@ def main():
                    for k, v in results.items()}, f, ensure_ascii=False, indent=2)
     print(f"wrote {output_json}")
 
-    single = results["single_model_baseline"]["metrics"]
-    full = results["full_pipeline"]["metrics"]
-    print("\n=== Quality-layer delta (full_pipeline - single_model_baseline) ===")
-    for metric_name in ["bleu", "chrf++", "ter", "comet"]:
-        s, f_ = single.get(metric_name), full.get(metric_name)
-        if s is not None and f_ is not None:
-            print(f"  {metric_name}: {f_ - s:+.2f}  (baseline={s:.2f}, full_pipeline={f_:.2f})")
+    if "single_model_baseline" in results and "full_pipeline" in results:
+        single = results["single_model_baseline"]["metrics"]
+        full = results["full_pipeline"]["metrics"]
+        print("\n=== Quality-layer delta (full_pipeline - single_model_baseline) ===")
+        for metric_name in ["bleu", "chrf++", "ter", "comet"]:
+            s, f_ = single.get(metric_name), full.get(metric_name)
+            if s is not None and f_ is not None:
+                print(f"  {metric_name}: {f_ - s:+.2f}  (baseline={s:.2f}, full_pipeline={f_:.2f})")
+    else:
+        print(f"\n(skipping quality-layer delta print -- this run only covered modes: {modes})")
 
 
 if __name__ == "__main__":

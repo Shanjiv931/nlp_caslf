@@ -71,9 +71,22 @@ def score_candidates_with_qe(source_text: str, candidates: List[Candidate], qe_m
         raise RuntimeError(f"no QE model available to score with: {_QE_LOAD_ERROR}")
 
     data = [{"src": source_text, "mt": c.text} for c in candidates]
-    output = qe_model.predict(data, batch_size=8, gpus=0)
+    output = qe_model.predict(data, batch_size=8, gpus=_comet_gpu_count())
     scores = output.scores if hasattr(output, "scores") else output["scores"]
     return list(zip(candidates, scores))
+
+
+def _comet_gpu_count():
+    """1 if a CUDA GPU is available, else 0. This call runs once per test
+    example inside quality_pipeline.py's full_pipeline mode, so hardcoding
+    `gpus=0` here (a real bug, not a deliberate CPU-only choice) had an
+    outsized effect on total eval runtime -- see eval/evaluate.py's copy
+    of this same helper for the full story (2026-09-05)."""
+    try:
+        import torch
+        return 1 if torch.cuda.is_available() else 0
+    except ImportError:
+        return 0
 
 
 def score_candidates_fallback(candidates: List[Candidate]) -> List[Tuple[Candidate, Optional[float]]]:
