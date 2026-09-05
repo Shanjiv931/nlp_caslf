@@ -188,13 +188,26 @@ def dedupe_candidates(candidates: List[Candidate]) -> List[Candidate]:
 def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_sample_candidates=2, max_new_tokens=128):
     import torch
 
+    # Debug checkpoints added 2026-09-05: after the GPU-placement fix, a
+    # full_pipeline run went silent again right after "IndicProcessor
+    # ready." with no change even after the model was confirmed on cuda
+    # (GPU Memory climbed, confirming the earlier fix took effect) -- this
+    # function's own steps (IndicProcessor preprocessing, tokenization,
+    # device transfer, the two generate() calls) had zero prints, so there
+    # was no way to tell which one, if any, was actually the new stall
+    # point versus just legitimately-slow-but-progressing work. Same
+    # rationale as load_engine's checkpoints: pin the exact location down
+    # empirically instead of guessing again.
+    print(f"[generate:{ctx.engine_key}] preprocessing source ...", flush=True)
     processed_source = preprocess_source(ctx, source_text)
+    print(f"[generate:{ctx.engine_key}] tokenizing ...", flush=True)
     inputs = ctx.tokenizer(processed_source, return_tensors="pt", truncation=True, max_length=128)
     # Companion fix to load_engine's model placement above: a model on GPU
     # with CPU-resident inputs raises "Expected all tensors to be on the
     # same device" the moment .generate() is called, so this has to move in
     # lockstep with that change.
     inputs = {k: v.to(ctx.device) for k, v in inputs.items()}
+    print(f"[generate:{ctx.engine_key}] inputs on {ctx.device}; starting beam search ...", flush=True)
 
     gen_kwargs_common = {}
     if ctx.is_nllb:
@@ -218,6 +231,7 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
             return_dict_in_generate=True,
             **gen_kwargs_common,
         )
+        print(f"[generate:{ctx.engine_key}] beam search done.", flush=True)
         beam_scores = beam_out.sequences_scores.tolist() if beam_out.sequences_scores is not None else [None] * len(beam_out.sequences)
         for seq, score in zip(beam_out.sequences, beam_scores):
             text = postprocess_output(ctx, ctx.tokenizer.decode(seq, skip_special_tokens=True))
@@ -242,6 +256,7 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
             # along with it, silently dropping IndicTrans2 from the ensemble
             # for that example instead of degrading to beam-only.
             try:
+                print(f"[generate:{ctx.engine_key}] starting nucleus sampling ...", flush=True)
                 sample_out = ctx.model.generate(
                     **inputs,
                     do_sample=True,
@@ -251,6 +266,7 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
                     max_new_tokens=max_new_tokens,
                     **gen_kwargs_common,
                 )
+                print(f"[generate:{ctx.engine_key}] nucleus sampling done.", flush=True)
                 for seq in sample_out:
                     text = postprocess_output(ctx, ctx.tokenizer.decode(seq, skip_special_tokens=True))
                     raw_candidates.append(Candidate(text=text, engine=ctx.engine_key, method="sample",
