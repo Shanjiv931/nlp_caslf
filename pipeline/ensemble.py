@@ -73,7 +73,19 @@ def _postprocess_with_timeout(ctx, decoded_text, label, timeout_seconds=_POSTPRO
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
 
-ALL_ENGINES = ["indictrans2", "nllb", "banglat5"]
+# indictrans2 excluded 2026-09-06: eval/diagnose_engines.py showed its raw
+# decode is completely input-independent garbage (near-identical degenerate
+# output across 5 totally different source sentences) with the LoRA adapter
+# BOTH on and off -- i.e. even the vanilla pretrained ai4bharat/indictrans2-
+# indic-en-1B model produces this via this codebase's current tokenizer
+# path (AutoTokenizer + trust_remote_code), which AI4Bharat's own published
+# benchmarks say should translate Bengali<->English well. This points at a
+# tokenizer/interface mismatch (AI4Bharat's official usage expects their
+# own IndicTransTokenizer class from the IndicTransToolkit package, not a
+# generic AutoTokenizer) rather than a bad model or a bad adapter -- likely
+# fixable, but out of scope to chase given the current 2-day submission
+# deadline. Re-add once that's investigated and confirmed fixed.
+ALL_ENGINES = ["nllb", "banglat5"]
 
 
 @dataclass

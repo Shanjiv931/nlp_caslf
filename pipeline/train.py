@@ -696,6 +696,32 @@ def main():
                 model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, trust_remote_code=True, **quant_kwargs)
         if not loaded_from_hub:
             model = get_peft_model(model, build_lora_config(args))
+
+    # Root cause found 2026-09-06, confirmed by directly inspecting the
+    # pushed adapter's weights (safetensors, no torch needed): banglat5's
+    # LoRA B matrices were ALL exactly zero -- every single one, mean_abs
+    # and max_abs both 0.0 -- meaning the adapter mathematically contributed
+    # nothing to generation regardless of what A learned (LoRA's forward is
+    # base + B @ A @ x; B=0 makes that term vanish entirely). This matches
+    # a well-documented PEFT + gradient-checkpointing interaction: with
+    # gradient_checkpointing=True (the default a few lines below) and no
+    # explicit `enable_input_require_grads()` call, gradients can fail to
+    # reach the LoRA parameters at all under reentrant-style checkpointing,
+    # leaving LoRA's zero-initialized B matrices stuck at zero for the
+    # entire training run -- training "completes" with no errors (matching
+    # what logs/phase_6_status.md recorded for banglat5) while silently
+    # never actually learning anything. This is the standard, documented
+    # fix. Harmless to call even if this specific model/config combination
+    # wasn't actually affected (nllb's adapter DID learn real weights, so
+    # whatever protected it -- likely an architecture-specific difference
+    # in how M2M100 vs. T5 handle gradient-checkpointing hooks -- this call
+    # is a no-op safety net for it either way).
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+        print("enable_input_require_grads() called -- required for LoRA gradients to "
+              "reach the adapter correctly under gradient checkpointing (see "
+              "logs/phase_6_status.md's banglat5 dead-adapter investigation).")
+
     model.print_trainable_parameters()
 
     is_indictrans2 = "indictrans2" in args.model_name.lower()
