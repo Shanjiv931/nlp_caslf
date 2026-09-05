@@ -233,8 +233,24 @@ def generate_candidates_for_engine(ctx, source_text, num_beam_candidates=2, num_
         )
         print(f"[generate:{ctx.engine_key}] beam search done.", flush=True)
         beam_scores = beam_out.sequences_scores.tolist() if beam_out.sequences_scores is not None else [None] * len(beam_out.sequences)
-        for seq, score in zip(beam_out.sequences, beam_scores):
-            text = postprocess_output(ctx, ctx.tokenizer.decode(seq, skip_special_tokens=True))
+        # Debug checkpoints added 2026-09-05: after beam search itself was
+        # confirmed done (previous checkpoint), a run went silent for 6+
+        # minutes with zero further output and zero movement on any Kaggle
+        # metric (Disk/CPU/RAM/GPU Memory all identical across checks) --
+        # the only untraced code between "beam search done" and the next
+        # planned checkpoint ("starting nucleus sampling") is this decode
+        # loop, specifically postprocess_output()'s call into
+        # IndicTransToolkit's IndicProcessor.postprocess_batch(), which does
+        # non-trivial CPU work (denormalization/desandhi) unrelated to the
+        # GPU or network -- so neither the earlier socket timeout nor the
+        # GPU fix could catch a stall here. Splitting decode vs postprocess
+        # into separate prints to find out which one it actually is.
+        for i, (seq, score) in enumerate(zip(beam_out.sequences, beam_scores)):
+            print(f"[generate:{ctx.engine_key}] decoding beam candidate {i} ...", flush=True)
+            decoded = ctx.tokenizer.decode(seq, skip_special_tokens=True)
+            print(f"[generate:{ctx.engine_key}] beam candidate {i} decoded; postprocessing ...", flush=True)
+            text = postprocess_output(ctx, decoded)
+            print(f"[generate:{ctx.engine_key}] beam candidate {i} postprocessed.", flush=True)
             raw_candidates.append(Candidate(text=text, engine=ctx.engine_key, method="beam",
                                              source_text=source_text, direction=ctx.direction,
                                              raw_score=score))
