@@ -87,11 +87,23 @@ def translate_full_pipeline(source_text, direction):
     return result["translation"] or ""
 
 
-def translate_pretrained_baseline(source_text, direction, engine_key="nllb"):
-    """The base model with NO LoRA adapter — never fine-tuned on this
-    project's data at all. Loaded independently of ensemble.load_engine()
-    (which always attaches a LoRA adapter) since this mode specifically
-    needs the adapter-free model."""
+_PRETRAINED_CTX_CACHE = {}
+
+
+def _load_pretrained_ctx(engine_key, direction):
+    """Cached per (engine_key, direction) -- without this, run_mode()'s
+    per-example call to translate_pretrained_baseline() re-triggers
+    AutoModelForSeq2SeqLM.from_pretrained() from scratch for EVERY test
+    example (200x for a 200-example run). For nllb/banglat5 (small models)
+    that was merely wasteful; for indictrans2 (4GB, 1B params) it meant
+    reloading the entire model 200 times in a row and never finishing in
+    any reasonable time -- a real bug, confirmed 2026-09-05 by a Kaggle
+    run stuck cycling `Loading weights: 100%|763/763` endlessly on this
+    exact mode/engine. Mirrors ensemble.py's load_engine() cache."""
+    cache_key = (engine_key, direction)
+    if cache_key in _PRETRAINED_CTX_CACHE:
+        return _PRETRAINED_CTX_CACHE[cache_key]
+
     import mt_compat as mc
 
     mc.ensure_all_compat_shims()
@@ -101,6 +113,13 @@ def translate_pretrained_baseline(source_text, direction, engine_key="nllb"):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
+    # Deliberately NOT moved to .cuda() here: generate_candidates_for_engine()
+    # never moves its tokenizer output off CPU, so putting the model on GPU
+    # while inputs stay on CPU would crash with a device mismatch. This
+    # matches ensemble.py's load_engine(), which has the same CPU-only
+    # behavior for the same reason -- generation-side GPU placement is a
+    # real, separate optimization opportunity, not fixed here to avoid
+    # shipping an untested device-mismatch bug alongside the caching fix.
 
     is_indictrans2 = engine_key == "indictrans2"
     is_nllb = engine_key == "nllb"
@@ -112,11 +131,24 @@ def translate_pretrained_baseline(source_text, direction, engine_key="nllb"):
         if hasattr(tokenizer, "tgt_lang"):
             tokenizer.tgt_lang = tgt_lang
 
-    from ensemble import EngineContext, generate_candidates_for_engine
+    from ensemble import EngineContext
 
     ctx = EngineContext(engine_key=engine_key, direction=direction, model=model, tokenizer=tokenizer,
                          indic_processor=indic_processor, is_indictrans2=is_indictrans2, is_nllb=is_nllb,
                          src_lang=src_lang, tgt_lang=tgt_lang)
+    _PRETRAINED_CTX_CACHE[cache_key] = ctx
+    return ctx
+
+
+def translate_pretrained_baseline(source_text, direction, engine_key="nllb"):
+    """The base model with NO LoRA adapter — never fine-tuned on this
+    project's data at all. Loaded independently of ensemble.load_engine()
+    (which always attaches a LoRA adapter) since this mode specifically
+    needs the adapter-free model. Model/tokenizer load itself is cached
+    (see _load_pretrained_ctx) -- only generation happens per call."""
+    from ensemble import generate_candidates_for_engine
+
+    ctx = _load_pretrained_ctx(engine_key, direction)
     candidates = generate_candidates_for_engine(ctx, source_text, num_beam_candidates=1, num_sample_candidates=0)
     return candidates[0].text if candidates else ""
 
